@@ -1,0 +1,20 @@
+{
+  "name": "glucer-desktop",
+  "productName": "Glucer",
+  "version": "1.0.0",
+  "description": "Glucer for desktop",
+  "author": "Glucer <hello@glucer.com>",
+  "main": "main.js",
+  "scripts": { "start": "electron .", "dist": "electron-builder" },
+  "devDependencies": { "electron": "latest", "electron-builder": "^26.0.0" },
+  "build": {
+    "appId": "com.glucer.desktop",
+    "productName": "Glucer",
+    "files": ["main.js", "offline.html", "package.json"],
+    "directories": { "output": "dist" },
+    "publish": [{ "provider": "github", "releaseType": "release" }],
+    "win": { "target": [{ "target": "nsis", "arch": ["x64"] }], "artifactName": "Glucer-Setup.${ext}" },
+    "mac": { "category": "public.app-category.productivity", "target": [{ "target": "dmg", "arch": ["arm64", "x64"] }], "artifactName": "Glucer-mac-${arch}.${ext}" },
+    "linux": { "target": ["AppImage"], "category": "Utility", "artifactName": "Glucer.${ext}" }
+  }
+}
