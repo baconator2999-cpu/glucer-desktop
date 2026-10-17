@@ -1,7 +1,7 @@
 {
   "name": "glucer-desktop",
   "productName": "Glucer",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Glucer for desktop",
   "author": "Glucer <hello@glucer.com>",
   "main": "main.js",
@@ -10,7 +10,7 @@
   "build": {
     "appId": "com.glucer.desktop",
     "productName": "Glucer",
-    "files": ["main.js", "offline.html", "package.json"],
+    "files": ["main.js", "preload.js", "offline.html", "package.json"],
     "directories": { "output": "dist" },
     "publish": [{ "provider": "github", "releaseType": "release" }],
     "win": { "target": [{ "target": "nsis", "arch": ["x64"] }], "artifactName": "Glucer-Setup.${ext}" },
