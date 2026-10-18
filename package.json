@@ -6,15 +6,15 @@
   "author": "Glucer <hello@glucer.com>",
   "main": "main.js",
   "scripts": { "start": "electron .", "dist": "electron-builder" },
-  "devDependencies": { "electron": "latest", "electron-builder": "^26.0.0" },
+  "devDependencies": { "electron": "44.9.0", "electron-builder": "^26.0.0" },
   "build": {
     "appId": "com.glucer.desktop",
     "productName": "Glucer",
-    "files": ["main.js", "preload.js", "offline.html", "package.json"],
+    "files": ["main.js", "preload.js", "offline.html", "package.json", "build/icon.png"],
     "directories": { "output": "dist" },
     "publish": [{ "provider": "github", "releaseType": "release" }],
-    "win": { "target": [{ "target": "nsis", "arch": ["x64"] }], "artifactName": "Glucer-Setup.${ext}" },
-    "mac": { "category": "public.app-category.productivity", "target": [{ "target": "dmg", "arch": ["arm64", "x64"] }], "artifactName": "Glucer-mac-${arch}.${ext}" },
-    "linux": { "target": ["AppImage"], "category": "Utility", "artifactName": "Glucer.${ext}" }
+    "win": { "target": [{ "target": "nsis", "arch": ["x64"] }], "artifactName": "Glucer-Setup.${ext}", "icon": "build/icon.ico" },
+    "mac": { "category": "public.app-category.productivity", "target": [{ "target": "dmg", "arch": ["arm64", "x64"] }], "artifactName": "Glucer-mac-${arch}.${ext}", "icon": "build/icon.icns" },
+    "linux": { "target": ["AppImage"], "category": "Utility", "artifactName": "Glucer.${ext}", "icon": "build/icons" }
   }
 }
