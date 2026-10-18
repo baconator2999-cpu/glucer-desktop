@@ -14,6 +14,12 @@ function isAllowed(url) {
   } catch (e) { return false; }
 }
 
+// Only real web links may be handed to the operating system.
+// file://, ms-msdt:, search-ms: and any app-registered scheme:// are dropped.
+function safeToOpen(url) {
+  try { return /^https?:$/.test(new URL(url).protocol); } catch (e) { return false; }
+}
+
 let win = null;
 let config = {};
 let allowAll = false; // "don't ask again", lasts only until the app closes
@@ -25,8 +31,8 @@ function saveConfig() { try { fs.writeFileSync(configFile(), JSON.stringify(conf
 /* ---------- Safe file tools ---------- */
 class ToolError extends Error {}
 const MAX_LIST = 500, MAX_FIND = 200, MAX_READ = 20000;
-const BLOCKED_WRITE = /\.(exe|bat|cmd|com|msi|scr|vbs|ps1|dll|lnk|command|jar|reg)$/i;
-const SECRET_NAMES = /(^|[\\/])(\.env[^\\/]*|id_rsa[^\\/]*|id_ed25519[^\\/]*|[^\\/]*\.(pem|key|pfx|p12|kdbx)|[^\\/]*password[^\\/]*|[^\\/]*secret[^\\/]*)$/i;
+const BLOCKED_WRITE = /\.(exe|bat|cmd|com|command|msi|scr|vbs|ps1|psm1|dll|lnk|jar|reg|hta|wsf|jse|vbe|sh|url|desktop|application|appx|msix)$/i;
+const SECRET_NAMES = /(^|[\\/])(\.env[^\\/]*|\.netrc|\.git-credentials|\.npmrc|\.aws([\\/].*)?|id_rsa[^\\/]*|id_ed25519[^\\/]*|id_ecdsa[^\\/]*|[^\\/]*\.(pem|key|pfx|p12|kdbx|jks)|[^\\/]*password[^\\/]*|[^\\/]*secret[^\\/]*|[^\\/]*credential[^\\/]*)$/i;
 
 function wsRoot() {
   if (!config.workspace) throw new ToolError("NO_WORKSPACE: No folder has been chosen. Ask the user to click the folder button and pick one.");
@@ -140,6 +146,13 @@ async function moveItems(args) {
   const moves = (Array.isArray(args.moves) ? args.moves : []).slice(0, 500);
   if (!moves.length) throw new ToolError("No moves were given.");
   const plan = moves.map((m) => ({ from: resolveInside(m.from), to: resolveInside(m.to) }));
+  // Same guardrails as writes apply to renames: no turning files into
+  // program types, and no renaming to or from secret-looking names to
+  // slip past the read filter.
+  for (const p of plan) {
+    if (BLOCKED_WRITE.test(p.to)) throw new ToolError("Glucer won't rename files into program types like that.");
+    if (SECRET_NAMES.test(p.from) !== SECRET_NAMES.test(p.to)) throw new ToolError("Glucer won't rename files to or from secret-looking names.");
+  }
   const dests = new Set();
   for (const p of plan) {
     if (p.from === root || p.to === root) throw new ToolError("Glucer can't move the workspace folder itself.");
@@ -253,6 +266,7 @@ function createWindow() {
   win = new BrowserWindow({
     width: 1200, height: 800, minWidth: 420, minHeight: 600,
     backgroundColor: "#1E1530", title: "Glucer", show: false, autoHideMenuBar: true,
+    icon: path.join(__dirname, "build", "icon.png"),
     webPreferences: { preload: path.join(__dirname, "preload.js"), contextIsolation: true, nodeIntegration: false, sandbox: true }
   });
 
@@ -262,10 +276,13 @@ function createWindow() {
   win.once("ready-to-show", () => win.show());
   win.loadURL(START_URL);
 
-  // Anything outside Glucer (links, checkout) opens in the normal browser
-  win.webContents.setWindowOpenHandler(({ url }) => { shell.openExternal(url); return { action: "deny" }; });
+  // Popups never open inside the app; only real http/https links may be
+  // handed to the system browser.
+  win.webContents.setWindowOpenHandler(({ url }) => { if (safeToOpen(url)) shell.openExternal(url); return { action: "deny" }; });
   win.webContents.on("will-navigate", (e, url) => {
-    if (!isAllowed(url) && !url.startsWith("file://")) { e.preventDefault(); shell.openExternal(url); }
+    if (isAllowed(url)) return;
+    e.preventDefault();
+    if (safeToOpen(url)) shell.openExternal(url);
   });
 
   // No internet: show a friendly page instead of a blank window
