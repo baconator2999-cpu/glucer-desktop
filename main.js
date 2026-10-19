@@ -262,6 +262,14 @@ ipcMain.handle("tool:run", async (event, name, args) => {
 });
 
 /* ---------- Window ---------- */
+
+const glucerAgent = require("./glucer-agent.js");
+ipcMain.handle("glucer2:call", (event, name, args, approved) => {
+  const url = (event.senderFrame && event.senderFrame.url) || "";
+  if (!isAllowed(url)) return { ok: false, error: "That page isn't allowed to use Computer access." };
+  return glucerAgent.handleCall(String(name), args, approved === true);
+});
+
 function createWindow() {
   win = new BrowserWindow({
     width: 1200, height: 800, minWidth: 420, minHeight: 600,
