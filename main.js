@@ -273,12 +273,12 @@ ipcMain.handle("glucer2:call", (event, name, args, approved, readOnly) => {
 
 function createWindow() {
   win = new BrowserWindow({
-  glucerExtras.attach(win);
     width: 1200, height: 800, minWidth: 420, minHeight: 600,
     backgroundColor: "#1E1530", title: "Glucer", show: false, autoHideMenuBar: true,
     icon: path.join(__dirname, "build", "icon.png"),
     webPreferences: { preload: path.join(__dirname, "preload.js"), contextIsolation: true, nodeIntegration: false, sandbox: true, backgroundThrottling: false }
   });
+  glucerExtras.attach(win);
 
   // Lets the website know it's running inside the desktop app
   win.webContents.setUserAgent(win.webContents.getUserAgent() + " GlucerDesktop/" + app.getVersion());
