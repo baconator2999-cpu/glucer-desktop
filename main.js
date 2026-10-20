@@ -264,18 +264,20 @@ ipcMain.handle("tool:run", async (event, name, args) => {
 /* ---------- Window ---------- */
 
 const glucerAgent = require("./glucer-agent.js");
-ipcMain.handle("glucer2:call", (event, name, args, approved) => {
+const glucerExtras = require("./glucer-extras.js");
+ipcMain.handle("glucer2:call", (event, name, args, approved, readOnly) => {
   const url = (event.senderFrame && event.senderFrame.url) || "";
   if (!isAllowed(url)) return { ok: false, error: "That page isn't allowed to use Computer access." };
-  return glucerAgent.handleCall(String(name), args, approved === true);
+  return glucerAgent.handleCall(String(name), args, approved === true, readOnly === true);
 });
 
 function createWindow() {
   win = new BrowserWindow({
+    glucerExtras.attach(win);
     width: 1200, height: 800, minWidth: 420, minHeight: 600,
     backgroundColor: "#1E1530", title: "Glucer", show: false, autoHideMenuBar: true,
     icon: path.join(__dirname, "build", "icon.png"),
-    webPreferences: { preload: path.join(__dirname, "preload.js"), contextIsolation: true, nodeIntegration: false, sandbox: true }
+    webPreferences: { preload: path.join(__dirname, "preload.js"), contextIsolation: true, nodeIntegration: false, sandbox: true, backgroundThrottling: false }
   });
 
   // Lets the website know it's running inside the desktop app
@@ -305,10 +307,11 @@ if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
   app.on("second-instance", () => {
-    if (win) { if (win.isMinimized()) win.restore(); win.focus(); }
+    if (win) { if (win.isMinimized()) win.restore(); win.show(); win.focus(); }
   });
   app.whenReady().then(() => {
     loadConfig();
+    glucerExtras.setup();
     session.defaultSession.setPermissionRequestHandler((wc, permission, callback, details) => {
       const ok = isAllowed(details.requestingUrl || "") && ["clipboard-sanitized-write", "fullscreen", "notifications"].includes(permission);
       callback(ok);
