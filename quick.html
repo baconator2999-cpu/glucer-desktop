@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+<title>Glucer quick ask</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1E1530; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  body { display: flex; align-items: center; padding: 0 16px; box-sizing: border-box; -webkit-app-region: drag; }
+  input { -webkit-app-region: no-drag; width: 100%; box-sizing: border-box; padding: 14px 16px; border: 2px solid #8B6FE8; border-radius: 14px; background: #2A2040; color: #fff; font-size: 18px; outline: none; }
+  input::placeholder { color: #9d93b8; }
+</style>
+</head>
+<body>
+<input id="q" placeholder="Ask Glucer anything... (Enter to send, Esc to close)" maxlength="6000" autofocus autocomplete="off">
+<script>
+  const q = document.getElementById("q");
+  q.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && q.value.trim()) { window.quick.submit(q.value); q.value = ""; }
+    if (e.key === "Escape") window.quick.close();
+  });
+  window.quick.onReset(() => { q.value = ""; q.focus(); });
+  window.addEventListener("focus", () => q.focus());
+</script>
+</body>
+</html>
