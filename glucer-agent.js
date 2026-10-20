@@ -1,6 +1,6 @@
-/* Glucer Agent: lets Glucer work with files, apps and commands on this computer.
+/* Glucer Agent: lets Glucer work with files, apps, your screen and clipboard on this computer.
    Website version:  node glucer-agent.js     (add --strict to approve in this window instead of in Glucer)
-   Desktop app:      loaded by the app itself (no server, nothing to run).                              */
+   Desktop app:      loaded by the app itself (no server, nothing to run).                                  */
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -30,6 +30,10 @@ class Denied extends Error {}
 const short = (full) => (full.startsWith(HOME) ? '~' + full.slice(HOME.length) : full);
 const newId = () => crypto.randomBytes(6).toString('hex');
 const arr = (v) => (Array.isArray(v) ? v : []).slice(0, 200);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const runCmd = (cmd, args, opts) => new Promise((resolve, reject) => {
+  execFile(cmd, args, Object.assign({ maxBuffer: 20 * 1024 * 1024 }, opts || {}), (err, stdout) => (err ? reject(err) : resolve(String(stdout))));
+});
 
 /* ---------- Protected places (always ask first) ---------- */
 const SENSITIVE_DIRS = [
@@ -65,11 +69,25 @@ function resolveP(p) {
   return full;
 }
 
-/* ---------- Undo history ---------- */
+/* ---------- Undo history and activity log ---------- */
 const HIST_FILE = path.join(DATA_DIR, 'history.json');
+const ACT_FILE = path.join(DATA_DIR, 'activity.jsonl');
 function loadHist() { try { return JSON.parse(fs.readFileSync(HIST_FILE, 'utf8')); } catch (e) { return []; } }
 function saveHist(h) { try { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(HIST_FILE, JSON.stringify(h.slice(-200))); } catch (e) {} }
 function logOp(op) { op.id = op.id || newId(); op.time = Date.now(); const h = loadHist(); h.push(op); saveHist(h); return op.id; }
+function logActivity(entry) {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.appendFileSync(ACT_FILE, JSON.stringify(entry) + '\n');
+    if (fs.statSync(ACT_FILE).size > 600000) {
+      const lines = fs.readFileSync(ACT_FILE, 'utf8').trim().split('\n');
+      fs.writeFileSync(ACT_FILE, lines.slice(-800).join('\n') + '\n');
+    }
+  } catch (e) {}
+}
+function readActivity(n) {
+  try { return fs.readFileSync(ACT_FILE, 'utf8').trim().split('\n').slice(-n).map((l) => JSON.parse(l)).reverse(); } catch (e) { return []; }
+}
 
 function movePath(from, to) {
   try { fs.renameSync(from, to); }
@@ -127,6 +145,78 @@ async function undoOp(id) {
   return { ok: true, result: { undone: n, problems }, summary: 'Undone (' + n + ' item' + (n === 1 ? '' : 's') + ')' + (problems.length ? ', ' + problems.length + ' couldn\'t be undone' : '') };
 }
 
+/* ---------- Screen and clipboard ---------- */
+async function takeScreenshot() {
+  if (IS_ELECTRON) {
+    const { desktopCapturer, screen } = require('electron');
+    const d = screen.getPrimaryDisplay();
+    const w = Math.min(1600, Math.round(d.size.width * d.scaleFactor));
+    const h = Math.round(w * d.size.height / d.size.width);
+    const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: w, height: h } });
+    const src = sources.find((s) => s.display_id === String(d.id)) || sources[0];
+    if (!src || src.thumbnail.isEmpty()) throw new Error('Could not capture the screen.');
+    return { mime: 'image/jpeg', data: src.thumbnail.toJPEG(75).toString('base64') };
+  }
+  const jpg = process.platform === 'win32' || process.platform === 'darwin';
+  const tmp = path.join(os.tmpdir(), 'glucer-shot-' + newId() + (jpg ? '.jpg' : '.png'));
+  try {
+    if (process.platform === 'win32') {
+      const script = [
+        "Add-Type -AssemblyName System.Windows.Forms,System.Drawing",
+        "Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public class GD { [DllImport(\"user32.dll\")] public static extern bool SetProcessDPIAware(); }'",
+        "[void][GD]::SetProcessDPIAware()",
+        "$b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds",
+        "$bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height",
+        "$g = [System.Drawing.Graphics]::FromImage($bmp)",
+        "$g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)",
+        "$w = [Math]::Min(1600, $b.Width); $h = [int]($b.Height * $w / $b.Width)",
+        "$out = New-Object System.Drawing.Bitmap $w, $h",
+        "$g2 = [System.Drawing.Graphics]::FromImage($out)",
+        "$g2.InterpolationMode = 'HighQualityBicubic'",
+        "$g2.DrawImage($bmp, 0, 0, $w, $h)",
+        "$out.Save($env:GLUCER_OUT, [System.Drawing.Imaging.ImageFormat]::Jpeg)"
+      ].join('; ');
+      await runCmd('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], { env: Object.assign({}, process.env, { GLUCER_OUT: tmp }) });
+    } else if (process.platform === 'darwin') {
+      await runCmd('screencapture', ['-x', '-t', 'jpg', tmp]);
+      await runCmd('sips', ['-Z', '1600', tmp]);
+    } else {
+      let done = false;
+      for (const t of [['grim', [tmp]], ['gnome-screenshot', ['-f', tmp]], ['scrot', ['-o', tmp]], ['import', ['-window', 'root', tmp]]]) {
+        try { await runCmd(t[0], t[1]); if (fs.existsSync(tmp)) { done = true; break; } } catch (e) {}
+      }
+      if (!done) throw new Error('No screenshot tool found. Install gnome-screenshot, scrot or grim.');
+    }
+    const buf = fs.readFileSync(tmp);
+    if (!buf.length) throw new Error('The screenshot came out empty.');
+    if (buf.length > 6 * 1024 * 1024) throw new Error('The screenshot is too large.');
+    return { mime: jpg ? 'image/jpeg' : 'image/png', data: buf.toString('base64') };
+  } finally { try { fs.unlinkSync(tmp); } catch (e) {} }
+}
+
+async function clipRead() {
+  let t;
+  if (IS_ELECTRON) t = require('electron').clipboard.readText();
+  else if (process.platform === 'win32') t = await runCmd('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', '[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-Clipboard -Raw']);
+  else if (process.platform === 'darwin') t = await runCmd('pbpaste', []);
+  else { try { t = await runCmd('wl-paste', ['--no-newline']); } catch (e) { t = await runCmd('xclip', ['-selection', 'clipboard', '-o']); } }
+  return String(t || '').replace(/^\uFEFF/, '');
+}
+function clipWrite(text) {
+  if (IS_ELECTRON) { require('electron').clipboard.writeText(text); return Promise.resolve(); }
+  return new Promise((resolve, reject) => {
+    let cmd, args;
+    if (process.platform === 'win32') { cmd = 'powershell.exe'; args = ['-NoProfile', '-NonInteractive', '-Command', '[Console]::InputEncoding=[Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())']; }
+    else if (process.platform === 'darwin') { cmd = 'pbcopy'; args = []; }
+    else { cmd = 'xclip'; args = ['-selection', 'clipboard']; }
+    const bad = () => reject(new Error('Could not use the clipboard on this computer.'));
+    const p = spawn(cmd, args, { stdio: ['pipe', 'ignore', 'ignore'] });
+    p.on('error', bad);
+    p.on('close', (code) => (code === 0 ? resolve() : bad()));
+    p.stdin.end(text, 'utf8');
+  });
+}
+
 /* ---------- Tools ---------- */
 const SKIP = new Set(['node_modules', '.git', 'AppData', 'Library', '$Recycle.Bin', 'System Volume Information', 'Windows', 'Program Files', 'Program Files (x86)', '.cache', '.npm']);
 const BINARY_EXT = /^(png|jpe?g|gif|webp|ico|bmp|pdf|zip|rar|7z|gz|tar|exe|dll|msi|iso|dmg|mp3|mp4|mov|avi|mkv|wav|flac|ttf|otf|woff2?|bin|dat|db|sqlite|class|jar|so|dylib|docx|xlsx|pptx)$/i;
@@ -135,6 +225,8 @@ const BLOCKED = [
   /\brm\s+-[a-z]*r[a-z]*\s+(\/|~|\$HOME|\*)(\s|$)/i, /\bmkfs/i, /\bdd\s+.*of=\/dev\//i, /\bformat\s+[a-z]:/i,
   /\b(rd|rmdir)\s+\/s.*\b[a-z]:\\?(\s|$)/i, /\bdel\s+.*\b[a-z]:\\\*?(\s|$)/i, /\bdiskpart\b/i, /\bshutdown\b/i, /:\(\)\s*\{/
 ];
+// Tools that only look. Read-only mode allows only these.
+const READ_OK_TOOLS = new Set(['system_info', 'list_folder', 'find_files', 'search_in_files', 'read_text_file', 'read_document', 'reveal_item', 'screenshot', 'clipboard_read', '__activity']);
 
 const TOOLS = {
   system_info: {
@@ -148,6 +240,35 @@ const TOOLS = {
         now: new Date().toString()
       }, 'Checked this computer');
     }
+  },
+
+  screenshot: {
+    plan: (a) => {
+      const d = Math.max(0, Math.min(10, Number(a.delay_seconds) || 0));
+      return { d, risk: 'high', lines: ['Take a screenshot of your main screen' + (d ? ' in ' + d + ' seconds (switch to the window you want Glucer to see)' : ''), 'The picture is sent to the AI service to answer you. Close anything private first.'] };
+    },
+    run: async (a, p) => {
+      if (p.d) await sleep(p.d * 1000);
+      const image = await takeScreenshot();
+      return ok({ note: 'The screenshot is attached to this message as an image.' }, 'Looked at your screen', { image });
+    }
+  },
+
+  clipboard_read: {
+    plan: () => ({ lines: ['Read what you last copied (your clipboard)'] }),
+    run: async () => {
+      const t = await clipRead();
+      return ok({ text: t.slice(0, 20000), truncated: t.length > 20000, empty: !t.trim() }, 'Read your clipboard (' + t.length + ' characters)');
+    }
+  },
+
+  clipboard_write: {
+    plan: (a) => {
+      if (typeof a.text !== 'string' || !a.text) throw new Error('No text given.');
+      if (a.text.length > 200000) throw new Error('That text is too long.');
+      return { lines: ['Put this on your clipboard (' + a.text.length + ' characters):', a.text.slice(0, 200) + (a.text.length > 200 ? '...' : '')] };
+    },
+    run: async (a) => { await clipWrite(a.text); return ok({ copied: true }, 'Copied to your clipboard'); }
   },
 
   list_folder: {
@@ -233,9 +354,8 @@ const TOOLS = {
       fs.readSync(fd, buf, 0, len, 0);
       fs.closeSync(fd);
       if (buf.includes(0)) throw new Error('This looks like a binary file, not text. Try read_document for PDF, Word or Excel files.');
-      let text = buf.toString('utf8');
-      const truncated = text.length > 20000 || st.size > len;
-      return ok({ path: p.full, text: text.slice(0, 20000), truncated }, 'Read ' + path.basename(p.full));
+      const text = buf.toString('utf8');
+      return ok({ path: p.full, text: text.slice(0, 20000), truncated: text.length > 20000 || st.size > len }, 'Read ' + path.basename(p.full));
     }
   },
 
@@ -444,8 +564,10 @@ function termAsk(lines) {
 }
 
 /* ---------- One entry point for everything ---------- */
-async function handleCall(name, args, approved) {
+async function handleCall(name, args, approved, readOnly) {
   try {
+    if (name === '__activity') return ok({ entries: readActivity(200) }, 'Loaded the activity log');
+    if (readOnly === true && !READ_OK_TOOLS.has(name)) return { ok: false, error: 'Read-only mode is on, so Glucer can look but not change anything.', summary: 'Blocked by read-only mode' };
     if (name === '__undo') return await undoOp(args && args.id);
     if (!Object.prototype.hasOwnProperty.call(TOOLS, name)) throw new Error('Unknown tool: ' + String(name).slice(0, 40));
     args = args && typeof args === 'object' ? args : {};
@@ -455,7 +577,9 @@ async function handleCall(name, args, approved) {
       if (STRICT) { if (!(await termAsk(plan.lines))) throw new Denied(); }
       else if (approved !== true) return { ok: false, needsApproval: true, lines: plan.lines.slice(0, 40), risk: plan.risk || 'normal', summary: 'Waiting for your OK' };
     }
-    return await tool.run(args, plan);
+    const r = await tool.run(args, plan);
+    logActivity({ t: Date.now(), tool: name, what: plan.lines ? plan.lines.slice(0, 3).join(' | ') : ((r && r.summary) || name), ok: !!(r && r.ok), result: r && (r.summary || r.error) });
+    return r;
   } catch (e) {
     if (e instanceof Denied) return { ok: false, denied: true, error: 'The user declined this action.', summary: 'You declined this' };
     const msg = (e && e.message) || 'Something went wrong';
@@ -495,7 +619,7 @@ if (AS_SERVER) {
         return;
       }
       if (msg.type === 'call') {
-        const r = await handleCall(String(msg.name || ''), msg.args, msg.approved === true);
+        const r = await handleCall(String(msg.name || ''), msg.args, msg.approved === true, msg.readOnly === true);
         try { ws.send(JSON.stringify({ type: 'result', id: msg.id, r })); } catch (e) {}
       }
     });
