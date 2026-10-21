@@ -317,7 +317,9 @@ function createWindow() {
   win.webContents.setUserAgent(win.webContents.getUserAgent() + " GlucerDesktop/" + app.getVersion());
 
   win.once("ready-to-show", () => win.show());
-  win.loadURL(START_URL);
+  // Add a fresh version tag on every launch so the app always loads the newest
+  // chat page from the website instead of a saved old copy (cache).
+  win.loadURL(START_URL + (START_URL.includes("?") ? "&" : "?") + "v=" + Date.now());
 
   // Popups never open inside the app; only real http/https links may be
   // handed to the system browser.
