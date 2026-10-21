@@ -267,12 +267,20 @@ const GM_CSHARP = [
   'public class GM {',
   '  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();',
   '  [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);',
+  '  [DllImport("user32.dll")] public static extern int GetSystemMetrics(int n);',
   '  [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, int d, UIntPtr e);',
   '}'
 ].join('\n');
 function mouseScript(x, y, actions) {
+  // Self-calibration: the process that clicks measures the real screen size
+  // itself and rescales, so a wrong scale report from Electron (display
+  // scaling, mixed DPI) can never steer the cursor to the wrong place.
+  const eW = Math.max(1, (lastShot && lastShot.screenW) || 0);
+  const eH = Math.max(1, (lastShot && lastShot.screenH) || 0);
   return ["$src = @'", GM_CSHARP, "'@", 'Add-Type -TypeDefinition $src', '[void][GM]::SetProcessDPIAware()',
-    '[void][GM]::SetCursorPos(' + x + ', ' + y + ')', 'Start-Sleep -Milliseconds 120', actions, 'Start-Sleep -Milliseconds 80'].join('\n');
+    '$sx = [double][GM]::GetSystemMetrics(0) / ' + eW + '; $sy = [double][GM]::GetSystemMetrics(1) / ' + eH,
+    '[void][GM]::SetCursorPos([int][Math]::Round(' + x + ' * $sx), [int][Math]::Round(' + y + ' * $sy))',
+    'Start-Sleep -Milliseconds 120', actions, 'Start-Sleep -Milliseconds 80'].join('\n');
 }
 const GT_CSHARP = [
   'using System;',
@@ -512,6 +520,143 @@ async function focusWindow(q) {
   }
 }
 
+/* ---------- Click by NAME (UI Automation — exact, never misses) ---------- */
+/* Asks the app itself where its button is, instead of aiming pixels at a
+   screenshot. Works on every app that exposes accessibility info (most do). */
+const UIA_CSHARP = [
+  'using System;',
+  'using System.Collections.Generic;',
+  'using System.Runtime.InteropServices;',
+  'using System.Threading;',
+  'using System.Windows.Automation;',
+  'public class UIA {',
+  '  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();',
+  '  [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);',
+  '  [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, int d, UIntPtr e);',
+  '  static AutomationElement Root() {',
+  '    IntPtr h = GetForegroundWindow();',
+  '    if (h != IntPtr.Zero) { try { return AutomationElement.FromHandle(h); } catch (Exception) {} }',
+  '    try { return AutomationElement.FocusedWindow; } catch (Exception) {}',
+  '    return AutomationElement.RootElement;',
+  '  }',
+  '  static string Label(AutomationElement e) {',
+  '    string t = "";',
+  '    try { t = e.Current.Name; } catch (Exception) {}',
+  '    string c = "";',
+  '    try { c = e.Current.ControlType.ProgrammaticName.Replace("ControlType.", ""); } catch (Exception) {}',
+  '    return c + ": " + (t == null ? "" : t);',
+  '  }',
+  '  static AutomationElement Walk(AutomationElement p, string ql, int depth) {',
+  '    if (p == null || depth > 9) return null;',
+  '    AutomationElementCollection kids;',
+  '    try { kids = p.FindAll(TreeScope.Children, Condition.TrueCondition); } catch (Exception) { return null; }',
+  '    foreach (AutomationElement k in kids) {',
+  '      string n = null;',
+  '      try { n = k.Current.Name; } catch (Exception) {}',
+  '      if (!string.IsNullOrEmpty(n) && n.ToLower().Contains(ql)) return k;',
+  '      var deep = Walk(k, ql, depth + 1);',
+  '      if (deep != null) return deep;',
+  '    }',
+  '    return null;',
+  '  }',
+  '  public static string Click(string name, string kind) {',
+  '    var root = Root();',
+  '    if (root == null) return "ERR: no active window to click in.";',
+  '    AutomationElement el = null;',
+  '    try { el = root.FindFirst(TreeScope.Descendants, new PropertyCondition(AutomationElement.NameProperty, name, PropertyConditionFlags.IgnoreCase)); } catch (Exception) {}',
+  '    if (el == null) el = Walk(root, name.ToLower(), 0);',
+  '    if (el == null) return "ERR: no element with that name in the active window. Call list_elements to see the exact names.";',
+  '    if (!string.IsNullOrEmpty(kind)) {',
+  '      try {',
+  '        string ct = el.Current.ControlType.ProgrammaticName.Replace("ControlType.", "");',
+  '        if (!ct.ToLower().StartsWith(kind.ToLower())) return "ERR: the name matched a " + ct + ", not a " + kind + ". Try list_elements and be more specific.";',
+  '      } catch (Exception) {}',
+  '    }',
+  '    double x = 0, y = 0; bool got = false;',
+  '    try { var pt = el.GetClickablePoint(); x = pt.X; y = pt.Y; got = true; } catch (Exception) {}',
+  '    if (!got) { try { var r = el.Current.BoundingRectangle; x = r.X + r.Width / 2; y = r.Y + r.Height / 2; got = r.Width > 0 && r.Height > 0; } catch (Exception) {} }',
+  '    if (!got) return "ERR: that element has no position on screen. Take a screenshot and use mouse_click instead.";',
+  '    SetCursorPos((int)x, (int)y);',
+  '    Thread.Sleep(120);',
+  '    mouse_event(2, 0, 0, 0, UIntPtr.Zero); Thread.Sleep(40); mouse_event(4, 0, 0, 0, UIntPtr.Zero);',
+  '    return "OK clicked " + Label(el) + " at (" + (int)x + ", " + (int)y + ")";',
+  '  }',
+  '  static void Collect(AutomationElement p, int depth, List<string> outp) {',
+  '    if (p == null || depth > 7 || outp.Count >= 80) return;',
+  '    AutomationElementCollection kids;',
+  '    try { kids = p.FindAll(TreeScope.Children, Condition.TrueCondition); } catch (Exception) { return; }',
+  '    foreach (AutomationElement k in kids) {',
+  '      string n = null;',
+  '      try { n = k.Current.Name; } catch (Exception) {}',
+  '      string c = "";',
+  '      try { c = k.Current.ControlType.ProgrammaticName.Replace("ControlType.", ""); } catch (Exception) {}',
+  '      if (!string.IsNullOrEmpty(n) && c != "ToolTip") outp.Add(c + ": " + n);',
+  '      if (outp.Count >= 80) return;',
+  '      Collect(k, depth + 1, outp);',
+  '    }',
+  '  }',
+  '  public static List<string> List() {',
+  '    var outp = new List<string>();',
+  '    Collect(Root(), 0, outp);',
+  '    return outp;',
+  '  }',
+  '}'
+].join('\n');
+const UIA_PS_PROLOG = ["$src = @'", UIA_CSHARP, "'@", 'Add-Type -ReferencedAssemblies UIAutomationClient,UIAutomationTypes,WindowsBase -TypeDefinition $src'];
+async function listElements() {
+  if (process.platform === 'win32') {
+    const out = await winPS(UIA_PS_PROLOG.concat(['[UIA]::List()']).join('\n'));
+    return out.split(/\r?\n/).map((s) => s.trim()).filter(Boolean).slice(0, 80);
+  }
+  if (process.platform === 'darwin') {
+    const lines = [
+      'tell application "System Events"',
+      'set ps to first application process whose frontmost is true',
+      'set outp to ""',
+      'repeat with e in (every UI element of window 1 of ps)',
+      'try',
+      'set outp to outp & (role of e) & ": " & (name of e) & linefeed',
+      'end try',
+      'end repeat',
+      'return outp',
+      'end tell'
+    ];
+    const out = await runCmd('osascript', lines.flatMap((l) => ['-e', l]));
+    return out.split(/\r?\n/).map((s) => s.trim()).filter(Boolean).slice(0, 80);
+  }
+  throw new Error('Listing window elements is not supported on this version of Linux yet. Take a screenshot and use mouse_click instead.');
+}
+async function clickElement(name, kind) {
+  if (process.platform === 'win32') {
+    const out = (await winPS(UIA_PS_PROLOG.concat(['[UIA]::Click($env:GLUCER_NAME, $env:GLUCER_KIND)']).join('\n'), { GLUCER_NAME: name, GLUCER_KIND: kind || '' })).trim();
+    if (out.startsWith('ERR')) throw new Error(out.replace(/^ERR:\s*/, ''));
+    return out.replace(/^OK\s*/, '');
+  }
+  if (process.platform === 'darwin') {
+    const lines = [
+      'on run argv',
+      'set q to (item 1 of argv)',
+      'tell application "System Events"',
+      'set ps to first application process whose frontmost is true',
+      'repeat with e in (every UI element of window 1 of ps)',
+      'try',
+      'if ((name of e) as string) contains q then',
+      'click e',
+      'return ("OK clicked " & (name of e))',
+      'end if',
+      'end try',
+      'end repeat',
+      'return "ERR: no element with that name in the front window. Call list_elements to see the names."',
+      'end tell',
+      'end run'
+    ];
+    const out = (await runCmd('osascript', lines.flatMap((l) => ['-e', l]).concat([name]))).trim();
+    if (out.startsWith('ERR')) throw new Error(out.replace(/^ERR:\s*/, ''));
+    return out.replace(/^OK\s*/, '');
+  }
+  throw new Error('Clicking by name is not supported on this version of Linux yet. Take a screenshot and use mouse_click instead.');
+}
+
 /* ---------- Tools ---------- */
 const SKIP = new Set(['node_modules', '.git', 'AppData', 'Library', '$Recycle.Bin', 'System Volume Information', 'Windows', 'Program Files', 'Program Files (x86)', '.cache', '.npm']);
 const BINARY_EXT = /^(png|jpe?g|gif|webp|ico|bmp|pdf|zip|rar|7z|gz|tar|exe|dll|msi|iso|dmg|mp3|mp4|mov|avi|mkv|wav|flac|ttf|otf|woff2?|bin|dat|db|sqlite|class|jar|so|dylib|docx|xlsx|pptx)$/i;
@@ -521,7 +666,7 @@ const BLOCKED = [
   /\b(rd|rmdir)\s+\/s.*\b[a-z]:\\?(\s|$)/i, /\bdel\s+.*\b[a-z]:\\\*?(\s|$)/i, /\bdiskpart\b/i, /\bshutdown\b/i, /:\(\)\s*\{/
 ];
 // Tools that only look. Read-only mode allows only these.
-const READ_OK_TOOLS = new Set(['system_info', 'list_folder', 'find_files', 'search_in_files', 'read_text_file', 'read_document', 'reveal_item', 'screenshot', 'clipboard_read', 'list_windows', '__activity']);
+const READ_OK_TOOLS = new Set(['system_info', 'list_folder', 'find_files', 'search_in_files', 'read_text_file', 'read_document', 'reveal_item', 'screenshot', 'clipboard_read', 'list_windows', 'list_elements', '__activity']);
 
 const TOOLS = {
   system_info: {
@@ -568,6 +713,28 @@ const TOOLS = {
     run: async (a, p) => {
       const t = await focusWindow(p.q);
       return ok({ focused: t }, 'Focused "' + t + '" — the keyboard now types there');
+    }
+  },
+
+  list_elements: {
+    plan: () => ({ lines: ['List the clickable things (buttons, menus, links) in the active window, by name'] }),
+    run: async () => {
+      const items = await listElements();
+      if (!items.length) throw new Error('No named elements found in the active window (it may not support this). Take a screenshot and use mouse_click instead.');
+      return ok({ elements: items, count: items.length }, 'Found ' + items.length + ' clickable things in the active window');
+    }
+  },
+
+  click_element: {
+    plan: (a) => {
+      const name = String(a.name || '').trim();
+      if (!name) throw new Error('Say what to click (its name, like "File" or "Save").');
+      const kind = ['button', 'menuitem', 'tabitem', 'link', 'hyperlink', 'checkbox', 'radiobutton', 'listitem', 'combobox', 'menu', 'treeitem'].includes(String(a.kind || '').toLowerCase()) ? String(a.kind).toLowerCase() : '';
+      return { name, kind, lines: ['Click "' + name + '"' + (kind ? ' (' + kind + ')' : '') + ' in the active window, by name'] };
+    },
+    run: async (a, p) => {
+      const detail = await clickElement(p.name, p.kind);
+      return ok({ clicked: p.name, detail }, 'Clicked "' + p.name + '" by name');
     }
   },
 
