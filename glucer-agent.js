@@ -146,6 +146,7 @@ async function undoOp(id) {
 }
 
 /* ---------- Screen and clipboard ---------- */
+let lastShot = null; // most recent screenshot, used to convert mouse coordinates
 async function takeScreenshot() {
   if (IS_ELECTRON) {
     const { desktopCapturer, screen } = require('electron');
@@ -155,9 +156,11 @@ async function takeScreenshot() {
     const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: w, height: h } });
     const src = sources.find((s) => s.display_id === String(d.id)) || sources[0];
     if (!src || src.thumbnail.isEmpty()) throw new Error('Could not capture the screen.');
-    return { mime: 'image/jpeg', data: src.thumbnail.toJPEG(75).toString('base64') };
+    const size = src.thumbnail.getSize();
+    return { mime: 'image/jpeg', data: src.thumbnail.toJPEG(75).toString('base64'), imgW: size.width, imgH: size.height, screenW: Math.round(d.size.width * d.scaleFactor), screenH: Math.round(d.size.height * d.scaleFactor) };
   }
   const jpg = process.platform === 'win32' || process.platform === 'darwin';
+  let shotDims = null; // [screenW, screenH, imgW, imgH]
   const tmp = path.join(os.tmpdir(), 'glucer-shot-' + newId() + (jpg ? '.jpg' : '.png'));
   try {
     if (process.platform === 'win32') {
@@ -174,12 +177,19 @@ async function takeScreenshot() {
         "$g2 = [System.Drawing.Graphics]::FromImage($out)",
         "$g2.InterpolationMode = 'HighQualityBicubic'",
         "$g2.DrawImage($bmp, 0, 0, $w, $h)",
-        "$out.Save($env:GLUCER_OUT, [System.Drawing.Imaging.ImageFormat]::Jpeg)"
+        "$out.Save($env:GLUCER_OUT, [System.Drawing.Imaging.ImageFormat]::Jpeg)",
+        'Write-Output ("{0} {1} {2} {3}" -f $b.Width, $b.Height, $w, $h)'
       ].join('; ');
-      await runCmd('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], { env: Object.assign({}, process.env, { GLUCER_OUT: tmp }) });
+      const out = await runCmd('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], { env: Object.assign({}, process.env, { GLUCER_OUT: tmp }) });
+      const d4 = out.trim().split(/\s+/).map(Number);
+      if (d4.length >= 4 && d4.every(Number.isFinite)) shotDims = d4;
     } else if (process.platform === 'darwin') {
       await runCmd('screencapture', ['-x', '-t', 'jpg', tmp]);
+      const dims = (s) => s.split(/\r?\n/).filter((l) => l.includes('pixel')).map((l) => Number(l.split(':')[1])).filter(Number.isFinite);
+      const orig = dims(await runCmd('sips', ['-g', 'pixelWidth', '-g', 'pixelHeight', tmp]));
       await runCmd('sips', ['-Z', '1600', tmp]);
+      const small = dims(await runCmd('sips', ['-g', 'pixelWidth', '-g', 'pixelHeight', tmp]));
+      if (orig.length >= 2 && small.length >= 2) shotDims = [orig[0], orig[1], small[0], small[1]];
     } else {
       let done = false;
       for (const t of [['grim', [tmp]], ['gnome-screenshot', ['-f', tmp]], ['scrot', ['-o', tmp]], ['import', ['-window', 'root', tmp]]]) {
@@ -190,7 +200,9 @@ async function takeScreenshot() {
     const buf = fs.readFileSync(tmp);
     if (!buf.length) throw new Error('The screenshot came out empty.');
     if (buf.length > 6 * 1024 * 1024) throw new Error('The screenshot is too large.');
-    return { mime: jpg ? 'image/jpeg' : 'image/png', data: buf.toString('base64') };
+    let imgW = shotDims ? shotDims[2] : 0, imgH = shotDims ? shotDims[3] : 0;
+    if (!imgW && !jpg) { try { imgW = buf.readUInt32BE(16); imgH = buf.readUInt32BE(20); } catch (e) {} }
+    return { mime: jpg ? 'image/jpeg' : 'image/png', data: buf.toString('base64'), imgW: imgW || 0, imgH: imgH || 0, screenW: shotDims ? shotDims[0] : (imgW || 0), screenH: shotDims ? shotDims[1] : (imgH || 0) };
   } finally { try { fs.unlinkSync(tmp); } catch (e) {} }
 }
 
@@ -215,6 +227,146 @@ function clipWrite(text) {
     p.on('close', (code) => (code === 0 ? resolve() : bad()));
     p.stdin.end(text, 'utf8');
   });
+}
+
+/* ---------- Mouse and keyboard (the "hands") ----------
+   Mouse coordinates always come from the LAST screenshot, in the pixels of
+   that picture. We convert them to real screen coordinates here, which also
+   handles the picture having been resized down before the AI saw it. */
+function toScreen(x, y) {
+  const nx = Number(x), ny = Number(y);
+  if (!Number.isFinite(nx) || !Number.isFinite(ny)) throw new Error('Those coordinates are not numbers.');
+  if (!lastShot || !lastShot.imgW) throw new Error('Look at the screen first (call screenshot), then use coordinates from that picture.');
+  const cx = Math.max(0, Math.min(lastShot.screenW - 1, Math.round(nx * lastShot.screenW / lastShot.imgW)));
+  const cy = Math.max(0, Math.min(lastShot.screenH - 1, Math.round(ny * lastShot.screenH / lastShot.imgH)));
+  return { cx, cy };
+}
+function winPS(script) {
+  return runCmd('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], { timeout: 60000 });
+}
+const GM_CSHARP = [
+  'using System;',
+  'using System.Runtime.InteropServices;',
+  'public class GM {',
+  '  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();',
+  '  [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);',
+  '  [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, int d, UIntPtr e);',
+  '}'
+].join('\n');
+function mouseScript(x, y, actions) {
+  return ["$src = @'", GM_CSHARP, "'@", 'Add-Type -TypeDefinition $src', '[void][GM]::SetProcessDPIAware()',
+    '[void][GM]::SetCursorPos(' + x + ', ' + y + ')', 'Start-Sleep -Milliseconds 120', actions, 'Start-Sleep -Milliseconds 80'].join('\n');
+}
+const GT_CSHARP = [
+  'using System;',
+  'using System.Runtime.InteropServices;',
+  'using System.Threading;',
+  'public class GT {',
+  '  [StructLayout(LayoutKind.Sequential)] public struct MOUSEINPUT { public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }',
+  '  [StructLayout(LayoutKind.Sequential)] public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }',
+  '  [StructLayout(LayoutKind.Explicit)] public struct UN { [FieldOffset(0)] public MOUSEINPUT mi; [FieldOffset(0)] public KEYBDINPUT ki; }',
+  '  [StructLayout(LayoutKind.Sequential)] public struct INPUT { public uint type; public UN u; }',
+  '  [DllImport("user32.dll", SetLastError = true)] public static extern uint SendInput(uint n, INPUT[] p, int size);',
+  '  public static string TypeText(string s) {',
+  '    int done = 0;',
+  '    foreach (char c in s) {',
+  '      INPUT d = new INPUT(); d.type = 1; d.u.ki.wScan = c; d.u.ki.dwFlags = 4;',
+  '      INPUT u = new INPUT(); u.type = 1; u.u.ki.wScan = c; u.u.ki.dwFlags = 6;',
+  '      INPUT[] two = new INPUT[] { d, u };',
+  '      if (SendInput(2, two, Marshal.SizeOf(typeof(INPUT))) == 2) done++;',
+  '      Thread.Sleep(8);',
+  '    }',
+  '    return done + " of " + s.Length + " characters typed";',
+  '  }',
+  '}'
+].join('\n');
+async function mouseClick(pos, btn) {
+  if (process.platform === 'win32') {
+    const acts = btn === 'right'
+      ? '[GM]::mouse_event(8,0,0,0,[UIntPtr]::Zero); Start-Sleep -Milliseconds 50; [GM]::mouse_event(16,0,0,0,[UIntPtr]::Zero)'
+      : btn === 'double'
+      ? '[GM]::mouse_event(2,0,0,0,[UIntPtr]::Zero); [GM]::mouse_event(4,0,0,0,[UIntPtr]::Zero); Start-Sleep -Milliseconds 70; [GM]::mouse_event(2,0,0,0,[UIntPtr]::Zero); [GM]::mouse_event(4,0,0,0,[UIntPtr]::Zero)'
+      : '[GM]::mouse_event(2,0,0,0,[UIntPtr]::Zero); Start-Sleep -Milliseconds 50; [GM]::mouse_event(4,0,0,0,[UIntPtr]::Zero)';
+    await winPS(mouseScript(pos.cx, pos.cy, acts));
+  } else if (process.platform === 'darwin') {
+    await runCmd('osascript', ['-e', 'tell application "System Events" to click at {' + pos.cx + ', ' + pos.cy + '}']);
+  } else {
+    const clickArg = btn === 'double' ? ['click', '--repeat', '2', '--delay', '90', '1'] : ['click', btn === 'right' ? '3' : '1'];
+    try { await runCmd('xdotool', ['mousemove', String(pos.cx), String(pos.cy)].concat(clickArg)); }
+    catch (e) { throw new Error('Could not control the mouse. On Linux, Glucer needs the xdotool package installed.'); }
+  }
+}
+async function mouseScroll(pos, dir, clicks) {
+  const delta = (dir === 'up' ? 1 : -1) * 120 * clicks;
+  if (process.platform === 'win32') {
+    const scroll = '[GM]::mouse_event(0x0800,0,0,' + delta + ',[UIntPtr]::Zero)';
+    if (pos) await winPS(mouseScript(pos.cx, pos.cy, scroll));
+    else await winPS(["$src = @'", GM_CSHARP, "'@", 'Add-Type -TypeDefinition $src', '[void][GM]::SetProcessDPIAware()', 'Start-Sleep -Milliseconds 50', scroll].join('\n'));
+  } else if (process.platform === 'darwin') {
+    throw new Error('Scrolling is not supported on the Mac yet.');
+  } else {
+    try { await runCmd('xdotool', ['click', '--repeat', String(clicks), '--delay', '60', dir === 'up' ? '4' : '5']); }
+    catch (e) { throw new Error('Could not scroll. On Linux, Glucer needs the xdotool package installed.'); }
+  }
+}
+async function keyboardType(text) {
+  if (process.platform === 'win32') {
+    const b64 = Buffer.from(text, 'utf8').toString('base64');
+    const script = ["$src = @'", GT_CSHARP, "'@", 'Add-Type -TypeDefinition $src',
+      "$text = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + b64 + "'))",
+      '[void][GT]::TypeText($text)'].join('\n');
+    await winPS(script);
+  } else if (process.platform === 'darwin') {
+    await runCmd('osascript', ['-e', 'on run argv', '-e', 'tell application "System Events" to keystroke (item 1 of argv)', '-e', 'end run', text]);
+  } else {
+    try { await runCmd('xdotool', ['type', '--delay', '12', '--', text]); }
+    catch (e) { throw new Error('Could not type. On Linux, Glucer needs the xdotool package installed.'); }
+  }
+}
+const SK_KEY = { enter: '{ENTER}', tab: '{TAB}', esc: '{ESC}', backspace: '{BS}', del: '{DEL}', insert: '{INS}', home: '{HOME}', end: '{END}', pageup: '{PGUP}', pagedown: '{PGDN}', up: '{UP}', down: '{DOWN}', left: '{LEFT}', right: '{RIGHT}', space: ' ', capslock: '{CAPSLOCK}' };
+const MAC_CODE = { enter: 36, tab: 48, esc: 53, backspace: 51, del: 117, home: 115, end: 119, pageup: 116, pagedown: 121, up: 126, down: 125, left: 123, right: 124, space: 49, f1: 122, f2: 120, f3: 99, f4: 118, f5: 96, f6: 97, f7: 98, f8: 100, f9: 101, f10: 109, f11: 103, f12: 111 };
+function parseCombo(key) {
+  const parts = String(key || '').toLowerCase().split('+').map((s) => s.trim()).filter(Boolean);
+  const NAMES = new Set(['enter', 'return', 'tab', 'esc', 'escape', 'backspace', 'space', 'capslock', 'del', 'delete', 'insert', 'home', 'end', 'pageup', 'pagedown', 'up', 'down', 'left', 'right']);
+  const mods = [];
+  let main = null;
+  for (const p of parts) {
+    if (p === 'ctrl' || p === 'control') { if (!mods.includes('ctrl')) mods.push('ctrl'); continue; }
+    if (p === 'alt' || p === 'option') { if (!mods.includes('alt')) mods.push('alt'); continue; }
+    if (p === 'shift') { if (!mods.includes('shift')) mods.push('shift'); continue; }
+    if (main) throw new Error('Use one main key, like ctrl+s or enter.');
+    if (p === 'win' || p === 'windows') throw new Error("The Windows key can't be sent — use ctrl+esc instead, which opens the Start menu.");
+    if (/^f([1-9]|1[0-2])$/.test(p) || NAMES.has(p) || /^[a-z0-9]$/.test(p)) { main = p === 'return' ? 'enter' : p === 'escape' ? 'esc' : p === 'delete' ? 'del' : p; continue; }
+    if (p.length === 1) { main = p; continue; }
+    throw new Error('Unknown key "' + p + '". Examples: enter, tab, esc, backspace, delete, up, down, left, right, home, end, pageup, pagedown, space, f5, or single letters — with ctrl, alt or shift, like ctrl+s or alt+f4.');
+  }
+  if (!main) throw new Error('Say which key to press (examples: enter, ctrl+s, alt+f4).');
+  return { mods, main };
+}
+const comboLabel = (c) => (c.mods.length ? c.mods.join('+') + '+' : '') + c.main;
+async function keyPress(c) {
+  if (process.platform === 'win32') {
+    const mods = (c.mods.includes('ctrl') ? '^' : '') + (c.mods.includes('alt') ? '%' : '') + (c.mods.includes('shift') ? '+' : '');
+    let main;
+    if (/^[a-z0-9]$/.test(c.main)) main = c.main.toUpperCase();
+    else if (/^f\d+$/.test(c.main)) main = '{' + c.main.toUpperCase() + '}';
+    else main = SK_KEY[c.main];
+    if (!main) throw new Error('That key is not supported on Windows yet.');
+    await runCmd('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait(\'' + mods + main + '\')'], { timeout: 30000 });
+  } else if (process.platform === 'darwin') {
+    const use = c.mods.length ? ' using {' + c.mods.map((m) => ({ ctrl: 'control down', alt: 'option down', shift: 'shift down' })[m]).join(', ') + '}' : '';
+    let line;
+    if (/^[a-z0-9]$/.test(c.main)) line = 'tell application "System Events" to keystroke "' + c.main + '"' + use;
+    else if (MAC_CODE[c.main]) line = 'tell application "System Events" to key code ' + MAC_CODE[c.main] + use;
+    else throw new Error('That key is not supported on the Mac yet.');
+    await runCmd('osascript', ['-e', line]);
+  } else {
+    const X = { enter: 'Return', tab: 'Tab', esc: 'Escape', backspace: 'BackSpace', del: 'Delete', insert: 'Insert', home: 'Home', end: 'End', pageup: 'Prior', pagedown: 'Next', space: 'space', capslock: 'Caps_Lock' };
+    const name = /^[a-z0-9]$/.test(c.main) || /^f\d+$/.test(c.main) ? c.main : X[c.main];
+    if (!name) throw new Error('That key is not supported on Linux yet.');
+    try { await runCmd('xdotool', ['key', c.mods.concat([name]).join('+')]); }
+    catch (e) { throw new Error('Could not press keys. On Linux, Glucer needs the xdotool package installed.'); }
+  }
 }
 
 /* ---------- Tools ---------- */
@@ -250,7 +402,8 @@ const TOOLS = {
     run: async (a, p) => {
       if (p.d) await sleep(p.d * 1000);
       const image = await takeScreenshot();
-      return ok({ note: 'The screenshot is attached to this message as an image.' }, 'Looked at your screen', { image });
+      if (image.imgW) lastShot = image;
+      return ok({ note: 'The screenshot is attached to this message as an image. Mouse tool coordinates are pixels in THIS picture (' + image.imgW + 'x' + image.imgH + ').' }, 'Looked at your screen', { image });
     }
   },
 
@@ -547,6 +700,55 @@ const TOOLS = {
         }, 'Ran: ' + p.cmd.slice(0, 60)));
       });
     })
+  },
+
+  mouse_click: {
+    plan: (a) => {
+      const p = toScreen(a.x, a.y);
+      const btn = ['left', 'right', 'double'].includes(a.button) ? a.button : 'left';
+      return { p, btn, lines: [(btn === 'double' ? 'DOUBLE-click' : 'Click the ' + btn.toUpperCase() + ' mouse button') + ' at screen position (' + p.cx + ', ' + p.cy + ')'] };
+    },
+    run: async (a, p) => {
+      await mouseClick(p.p, p.btn);
+      return ok({ x: p.p.cx, y: p.p.cy, button: p.btn }, 'Clicked ' + p.btn + ' at (' + p.p.cx + ', ' + p.p.cy + ')');
+    }
+  },
+
+  mouse_scroll: {
+    plan: (a) => {
+      const dir = a.direction === 'up' ? 'up' : 'down';
+      const n = Math.max(1, Math.min(10, Math.round(Number(a.clicks) || 3)));
+      const pos = (a.x != null && a.y != null) ? toScreen(a.x, a.y) : null;
+      return { dir, n, pos, lines: ['Scroll ' + dir + ' ' + n + ' notches' + (pos ? ' at (' + pos.cx + ', ' + pos.cy + ')' : ' where the mouse pointer is')] };
+    },
+    run: async (a, p) => {
+      await mouseScroll(p.pos, p.dir, p.n);
+      return ok({ direction: p.dir, clicks: p.n }, 'Scrolled ' + p.dir + ' ' + p.n + ' notches');
+    }
+  },
+
+  keyboard_type: {
+    plan: (a) => {
+      const t = String(a.text == null ? '' : a.text);
+      if (!t.trim()) throw new Error('No text given.');
+      if (t.length > 500) throw new Error('Too long to type. For long text, use clipboard_write, then key_press with ctrl+v.');
+      return { t, lines: ['Type this with the keyboard into whatever window is active:', t.slice(0, 200) + (t.length > 200 ? '...' : '')] };
+    },
+    run: async (a, p) => {
+      await keyboardType(p.t);
+      return ok({ typed: p.t.length }, 'Typed ' + p.t.length + ' characters');
+    }
+  },
+
+  key_press: {
+    plan: (a) => {
+      const c = parseCombo(a && a.key);
+      return { c, lines: ['Press keys: ' + comboLabel(c)] };
+    },
+    run: async (a, p) => {
+      await keyPress(p.c);
+      return ok({ key: comboLabel(p.c) }, 'Pressed ' + comboLabel(p.c));
+    }
   }
 };
 
