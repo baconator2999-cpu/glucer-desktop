@@ -14,7 +14,7 @@
     "files": ["main.js", "preload.js", "glucer-agent.js", "glucer-extras.js", "quick.html", "quick-preload.js", "offline.html", "package.json", "build/icon.png", "node_modules/**/*"],
     "directories": { "output": "dist" },
     "publish": [{ "provider": "github", "releaseType": "release" }],
-    "win": { "target": [{ "target": "nsis", "arch": ["x64"] }], "artifactName": "Glucer.${ext}" },
-    "linux": { "target": ["AppImage"], "category": "Utility", "artifactName": "Glucer.${ext}" }
+    "win": { "target": [{ "target": "nsis", "arch": ["x64"] }], "artifactName": "Glucer-Setup.${ext}" },
+    "linux": { "target": ["AppImage"], "category": "Utility", "artifactName": "Glucer-.${ext}" }
   }
 }
