@@ -24,6 +24,15 @@ let win = null;
 let config = {};
 let allowAll = false; // "don't ask again", lasts only until the app closes
 
+// Tools the user clicked "Always allow this" for. Saved to disk, so it
+// survives restarting the app. Clear it by deleting the file listed below.
+let alwaysTools = new Set();
+const alwaysFile = () => path.join(app.getPath("userData"), "glucer-always-allow.json");
+function loadAlways() { try { const v = JSON.parse(fs.readFileSync(alwaysFile(), "utf8")); if (Array.isArray(v)) alwaysTools = new Set(v.filter((x) => typeof x === "string")); } catch (e) {} }
+function saveAlways() { try { fs.writeFileSync(alwaysFile(), JSON.stringify([...alwaysTools])); } catch (e) {} }
+// Running arbitrary commands stays approve-every-time, even if asked.
+const NEVER_ALWAYS = new Set(["run_command"]);
+
 const configFile = () => path.join(app.getPath("userData"), "glucer-config.json");
 function loadConfig() { try { config = JSON.parse(fs.readFileSync(configFile(), "utf8")) || {}; } catch (e) { config = {}; } }
 function saveConfig() { try { fs.writeFileSync(configFile(), JSON.stringify(config)); } catch (e) {} }
@@ -265,10 +274,34 @@ ipcMain.handle("tool:run", async (event, name, args) => {
 
 const glucerAgent = require("./glucer-agent.js");
 const glucerExtras = require("./glucer-extras.js");
-ipcMain.handle("glucer2:call", (event, name, args, approved, readOnly) => {
+ipcMain.handle("glucer2:call", async (event, name, args, approved, readOnly) => {
   const url = (event.senderFrame && event.senderFrame.url) || "";
   if (!isAllowed(url)) return { ok: false, error: "That page isn't allowed to use Computer access." };
-  return glucerAgent.handleCall(String(name), args, approved === true, readOnly === true);
+  name = String(name);
+  let r = await glucerAgent.handleCall(name, args, approved === true, readOnly === true);
+  // When a tool needs the OK, show our own pop-up with an "Always allow this"
+  // button. It replaces the in-chat approval for this tool permanently.
+  if (r && r.needsApproval) {
+    if (alwaysTools.has(name)) {
+      r = await glucerAgent.handleCall(name, args, true, readOnly === true);
+    } else {
+      const opts = {
+        type: "question", noLink: true, defaultId: 0, cancelId: 2,
+        title: "Glucer wants to act on the computer",
+        message: "Allow this action?",
+        detail: (r.lines || []).join("\n").slice(0, 1800),
+        buttons: ["Allow", "Always allow this", "No"]
+      };
+      const choice = await (win ? dialog.showMessageBox(win, opts) : dialog.showMessageBox(opts));
+      if (choice.response === 2) {
+        r = { ok: false, denied: true, error: "The user declined this action.", summary: "You declined this" };
+      } else {
+        if (choice.response === 1 && !NEVER_ALWAYS.has(name)) { alwaysTools.add(name); saveAlways(); }
+        r = await glucerAgent.handleCall(name, args, true, readOnly === true);
+      }
+    }
+  }
+  return r;
 });
 
 function createWindow() {
@@ -311,6 +344,7 @@ if (!app.requestSingleInstanceLock()) {
   });
   app.whenReady().then(() => {
     loadConfig();
+    loadAlways();
     glucerExtras.setup();
     session.defaultSession.setPermissionRequestHandler((wc, permission, callback, details) => {
       const ok = isAllowed(details.requestingUrl || "") && ["clipboard-sanitized-write", "fullscreen", "notifications"].includes(permission);
