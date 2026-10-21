@@ -147,9 +147,96 @@ async function undoOp(id) {
 
 /* ---------- Screen and clipboard ---------- */
 let lastShot = null; // most recent screenshot, used to convert mouse coordinates
-async function takeScreenshot() {
+/* Multi-monitor: this asks Windows itself which monitors exist (in physical
+   pixels), which one has the active window, and returns the rectangle of the
+   one to photograph. That rectangle is the monitor's true position on the
+   whole desktop — so clicks can reach the second monitor and beyond. */
+const GMON_CSHARP = [
+  'using System;',
+  'using System.Collections.Generic;',
+  'using System.Runtime.InteropServices;',
+  'public class GMON {',
+  '  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();',
+  '  [DllImport("user32.dll")] public static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr clip, MCB cb, IntPtr data);',
+  '  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();',
+  '  [DllImport("user32.dll")] public static extern IntPtr MonitorFromWindow(IntPtr h, uint f);',
+  '  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool GetMonitorInfo(IntPtr hMon, ref MONITORINFOEX mi);',
+  '  [DllImport("user32.dll")] public static extern int GetSystemMetrics(int n);',
+  '  public delegate bool MCB(IntPtr hMon, IntPtr hdc, ref RECT rc, IntPtr data);',
+  '  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L; public int T; public int R; public int B; }',
+  '  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]',
+  '  public struct MONITORINFOEX {',
+  '    public int cbSize; public RECT rcMonitor; public RECT rcWork; public uint dwFlags;',
+  '    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dev;',
+  '  }',
+  '  public struct MON { public IntPtr h; public MONITORINFOEX mi; }',
+  '  static List<MON> mons = new List<MON>();',
+  '  static bool Collect(IntPtr h, IntPtr dc, ref RECT rc, IntPtr data) {',
+  '    MON m = new MON(); m.h = h; m.mi = new MONITORINFOEX(); m.mi.cbSize = Marshal.SizeOf(typeof(MONITORINFOEX));',
+  '    try { GetMonitorInfo(h, ref m.mi); } catch (Exception) {}',
+  '    mons.Add(m); return true;',
+  '  }',
+  '  public static string Select(string disp) {',
+  '    SetProcessDPIAware();',
+  '    mons.Clear();',
+  '    EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, Collect, IntPtr.Zero);',
+  '    if (mons.Count == 0) return "1 1 0 0 " + GetSystemMetrics(0) + " " + GetSystemMetrics(1);',
+  '    int pick = -1;',
+  '    int d = 0;',
+  '    if (int.TryParse(disp == null ? "" : disp.Trim(), out d) && d >= 1 && d <= mons.Count) pick = d - 1;',
+  '    if (pick < 0) {',
+  '      IntPtr fg = GetForegroundWindow();',
+  '      if (fg != IntPtr.Zero) {',
+  '        IntPtr hm = MonitorFromWindow(fg, 2);',
+  '        if (hm != IntPtr.Zero) for (int i = 0; i < mons.Count; i++) if (mons[i].h == hm) { pick = i; break; }',
+  '      }',
+  '    }',
+  '    if (pick < 0) for (int i = 0; i < mons.Count; i++) if ((mons[i].mi.dwFlags & 1) != 0) { pick = i; break; }',
+  '    if (pick < 0) pick = 0;',
+  '    RECT r = mons[pick].mi.rcMonitor;',
+  '    return (pick + 1) + " " + mons.Count + " " + r.L + " " + r.T + " " + (r.R - r.L) + " " + (r.B - r.T);',
+  '  }',
+  '}'
+].join('\n');
+async function winCaptureMonitor(displayArg) {
+  const tmp = path.join(os.tmpdir(), 'glucer-shot-' + newId() + '.jpg');
+  try {
+    const script = [
+      "$src = @'", GMON_CSHARP, "'@",
+      'Add-Type -TypeDefinition $src',
+      "$sel = ([GMON]::Select($env:GLUCER_DISP) -split '\\s+')",
+      '$L = [int]$sel[2]; $T = [int]$sel[3]; $W = [int]$sel[4]; $H = [int]$sel[5]',
+      'Add-Type -AssemblyName System.Windows.Forms,System.Drawing',
+      '$bmp = New-Object System.Drawing.Bitmap $W, $H',
+      '$g = [System.Drawing.Graphics]::FromImage($bmp)',
+      '$g.CopyFromScreen($L, $T, 0, 0, (New-Object System.Drawing.Size($W, $H)))',
+      '$w = [Math]::Min(1600, $W); $h = [int]($H * $w / $W)',
+      '$out = New-Object System.Drawing.Bitmap $w, $h',
+      '$g2 = [System.Drawing.Graphics]::FromImage($out)',
+      "$g2.InterpolationMode = 'HighQualityBicubic'",
+      '$g2.DrawImage($bmp, 0, 0, $w, $h)',
+      '$out.Save($env:GLUCER_OUT, [System.Drawing.Imaging.ImageFormat]::Jpeg)',
+      'Write-Output ("{0} {1} {2} {3} {4} {5} {6} {7}" -f $sel[0], $sel[1], $L, $T, $W, $H, $w, $h)'
+    ].join('\n');
+    const out = await runCmd('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+      { env: Object.assign({}, process.env, { GLUCER_OUT: tmp, GLUCER_DISP: displayArg == null ? '' : String(displayArg) }), timeout: 60000 });
+    const n = out.trim().split(/\s+/).map(Number);
+    if (n.length < 8 || !n.every(Number.isFinite)) throw new Error('bad shot output');
+    const buf = fs.readFileSync(tmp);
+    if (!buf.length) throw new Error('The screenshot came out empty.');
+    return { mime: 'image/jpeg', data: buf.toString('base64'), imgW: n[6], imgH: n[7], screenW: n[4], screenH: n[5], originX: n[2], originY: n[3], scale: 1, mon: n[0], monCount: n[1], at: Date.now() };
+  } finally { try { fs.unlinkSync(tmp); } catch (e) {} }
+}
+async function takeScreenshot(displayArg) {
   if (IS_ELECTRON) {
     const { desktopCapturer, screen } = require('electron');
+    const displays = screen.getAllDisplays();
+    // More than one monitor (or a specific monitor asked for): photograph the
+    // exact monitor through Windows so the picture matches true desktop
+    // coordinates and the mouse can reach every display.
+    if (process.platform === 'win32' && (displays.length > 1 || (displayArg != null && Number(displayArg) >= 1))) {
+      try { return await winCaptureMonitor(displayArg); } catch (e) {}
+    }
     const d = screen.getPrimaryDisplay();
     const physW = Math.round(d.size.width * d.scaleFactor), physH = Math.round(d.size.height * d.scaleFactor);
     const w = Math.min(1600, physW);
@@ -163,8 +250,9 @@ async function takeScreenshot() {
       sources[0];
     if (!src || src.thumbnail.isEmpty()) throw new Error('Could not capture the screen.');
     const size = src.thumbnail.getSize();
-    return { mime: 'image/jpeg', data: src.thumbnail.toJPEG(75).toString('base64'), imgW: size.width, imgH: size.height, screenW: physW, screenH: physH, scale: d.scaleFactor, at: Date.now() };
+    return { mime: 'image/jpeg', data: src.thumbnail.toJPEG(75).toString('base64'), imgW: size.width, imgH: size.height, screenW: physW, screenH: physH, originX: 0, originY: 0, mon: displays.findIndex((x) => x.id === d.id) + 1 || 1, monCount: displays.length, scale: d.scaleFactor, at: Date.now() };
   }
+  if (process.platform === 'win32') { try { return await winCaptureMonitor(displayArg); } catch (e) {} }
   const jpg = process.platform === 'win32' || process.platform === 'darwin';
   let shotDims = null; // [screenW, screenH, imgW, imgH]
   const tmp = path.join(os.tmpdir(), 'glucer-shot-' + newId() + (jpg ? '.jpg' : '.png'));
@@ -245,8 +333,12 @@ function toScreen(x, y) {
   if (!lastShot || !lastShot.imgW) throw new Error('I could not check the screen to aim the mouse.');
   // Mac clicking works in points, not pixels, so divide Retina captures down.
   const divide = process.platform === 'darwin' && lastShot.scale > 1 ? lastShot.scale : 1;
-  const cx = Math.max(0, Math.min(Math.round(lastShot.screenW / divide) - 1, Math.round(nx * lastShot.screenW / lastShot.imgW / divide)));
-  const cy = Math.max(0, Math.min(Math.round(lastShot.screenH / divide) - 1, Math.round(ny * lastShot.screenH / lastShot.imgH / divide)));
+  // The picture may belong to a monitor that does not sit at the desktop's
+  // top-left corner (second monitor, or one placed to the left), so add its
+  // true position on the desktop before aiming.
+  const ox = Number(lastShot.originX) || 0, oy = Number(lastShot.originY) || 0;
+  const cx = ox + Math.max(0, Math.min(Math.round(lastShot.screenW / divide) - 1, Math.round(nx * lastShot.screenW / lastShot.imgW / divide)));
+  const cy = oy + Math.max(0, Math.min(Math.round(lastShot.screenH / divide) - 1, Math.round(ny * lastShot.screenH / lastShot.imgH / divide)));
   return { cx, cy };
 }
 // Before any mouse action, if the last look at the screen is older than this,
@@ -254,7 +346,9 @@ function toScreen(x, y) {
 const SHOT_MAX_AGE = 8000;
 async function ensureShot() {
   if (lastShot && lastShot.imgW && Date.now() - (lastShot.at || 0) <= SHOT_MAX_AGE) return false;
-  try { const img = await takeScreenshot(); if (img && img.imgW) { lastShot = img; return true; } } catch (e) {}
+  // Re-capture the SAME monitor the last picture came from — the coordinates
+  // the AI is aiming with belong to that picture.
+  try { const img = await takeScreenshot(lastShot && lastShot.monCount > 1 ? lastShot.mon : undefined); if (img && img.imgW) { lastShot = img; return true; } } catch (e) {}
   return false;
 }
 function winPS(script, extraEnv) {
@@ -272,6 +366,14 @@ const GM_CSHARP = [
   '}'
 ].join('\n');
 function mouseScript(x, y, actions) {
+  // Multi-monitor pictures carry their monitor's true desktop position, so the
+  // click process (which is DPI-aware) moves the cursor straight there — that
+  // is what lets it reach the second monitor and monitors to the left.
+  if (lastShot && (Number(lastShot.originX) || Number(lastShot.originY))) {
+    return ["$src = @'", GM_CSHARP, "'@", 'Add-Type -TypeDefinition $src', '[void][GM]::SetProcessDPIAware()',
+      '[void][GM]::SetCursorPos(' + Math.round(x) + ', ' + Math.round(y) + ')',
+      'Start-Sleep -Milliseconds 120', actions, 'Start-Sleep -Milliseconds 80'].join('\n');
+  }
   // Self-calibration: the process that clicks measures the real screen size
   // itself and rescales, so a wrong scale report from Electron (display
   // scaling, mixed DPI) can never steer the cursor to the wrong place.
@@ -402,11 +504,21 @@ const LW_CSHARP = [
   'using System.Runtime.InteropServices;',
   'public class LW {',
   '  public delegate bool P(IntPtr h, IntPtr l);',
+  '  public delegate bool MCB(IntPtr hm, IntPtr dc, ref RECT rc, IntPtr d);',
   '  [DllImport("user32.dll")] public static extern bool EnumWindows(P cb, IntPtr l);',
+  '  [DllImport("user32.dll")] public static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr clip, MCB cb, IntPtr d);',
   '  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);',
   '  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder sb, int n);',
   '  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);',
+  '  [DllImport("user32.dll")] public static extern IntPtr MonitorFromWindow(IntPtr h, uint f);',
+  '  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();',
+  '  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L; public int T; public int R; public int B; }',
+  '  static List<IntPtr> hmons = new List<IntPtr>();',
+  '  static bool MonCb(IntPtr hm, IntPtr dc, ref RECT rc, IntPtr d) { hmons.Add(hm); return true; }',
   '  public static List<string> Get() {',
+  '    SetProcessDPIAware();',
+  '    hmons.Clear();',
+  '    EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, MonCb, IntPtr.Zero);',
   '    var outp = new List<string>();',
   '    EnumWindows(delegate(IntPtr h, IntPtr l) {',
   '      if (!IsWindowVisible(h)) return true;',
@@ -414,7 +526,10 @@ const LW_CSHARP = [
   '      if (GetWindowText(h, sb, 512) < 1) return true;',
   '      string t = sb.ToString();',
   '      if (t == "Program Manager" || t == "Windows Input Experience" || t == "Microsoft Text Input Application") return true;',
-  '      outp.Add((IsIconic(h) ? "[minimized] " : "") + t);',
+  '      int mon = 1;',
+  '      IntPtr hm = MonitorFromWindow(h, 2);',
+  '      if (hm != IntPtr.Zero) { int ix = hmons.IndexOf(hm); if (ix >= 0) mon = ix + 1; }',
+  '      outp.Add("[disp " + mon + "] " + (IsIconic(h) ? "[minimized] " : "") + t);',
   '      return true;',
   '    }, IntPtr.Zero);',
   '    return outp;',
@@ -533,7 +648,9 @@ const UIA_CSHARP = [
   '  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();',
   '  [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);',
   '  [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, int d, UIntPtr e);',
+  '  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();',
   '  static AutomationElement Root() {',
+  '    SetProcessDPIAware();',
   '    IntPtr h = GetForegroundWindow();',
   '    if (h != IntPtr.Zero) { try { return AutomationElement.FromHandle(h); } catch (Exception) {} }',
   '    try { return AutomationElement.FocusedWindow; } catch (Exception) {}',
@@ -685,13 +802,15 @@ const TOOLS = {
   screenshot: {
     plan: (a) => {
       const d = Math.max(0, Math.min(10, Number(a.delay_seconds) || 0));
-      return { d, risk: 'high', lines: ['Take a screenshot of your main screen' + (d ? ' in ' + d + ' seconds (switch to the window you want Glucer to see)' : ''), 'The picture is sent to the AI service to answer you. Close anything private first.'] };
+      const disp = a.display == null || a.display === '' ? null : (Number(a.display) >= 1 ? Math.round(Number(a.display)) : null);
+      return { d, disp, risk: 'high', lines: ['Take a screenshot' + (disp ? ' of monitor ' + disp : ' of the monitor with the active window') + (d ? ' in ' + d + ' seconds (switch to the window you want Glucer to see)' : ''), 'The picture is sent to the AI service to answer you. Close anything private first.'] };
     },
     run: async (a, p) => {
       if (p.d) await sleep(p.d * 1000);
-      const image = await takeScreenshot();
+      const image = await takeScreenshot(p.disp);
       if (image.imgW) lastShot = image;
-      return ok({ note: 'The screenshot is attached to this message as an image. Mouse tool coordinates are pixels in THIS picture (' + image.imgW + 'x' + image.imgH + ').' }, 'Looked at your screen', { image });
+      const monTxt = image.monCount > 1 ? ' — monitor ' + (image.mon || 1) + ' of ' + image.monCount : '';
+      return ok({ note: 'The screenshot is attached to this message as an image. Mouse tool coordinates are pixels in THIS picture (' + image.imgW + 'x' + image.imgH + ')' + monTxt + ', and clicking works on every monitor.', monitor: image.mon || 1, monitors: image.monCount || 1 }, 'Looked at your screen' + monTxt, { image });
     }
   },
 
