@@ -210,13 +210,25 @@ async function winCaptureMonitor(displayArg) {
       '$bmp = New-Object System.Drawing.Bitmap $W, $H',
       '$g = [System.Drawing.Graphics]::FromImage($bmp)',
       '$g.CopyFromScreen($L, $T, 0, 0, (New-Object System.Drawing.Size($W, $H)))',
-      '$w = [Math]::Min(1600, $W); $h = [int]($H * $w / $W)',
-      '$out = New-Object System.Drawing.Bitmap $w, $h',
+      '# PS vars are case-INSENSITIVE, so use fresh names ($iw/$ih) - reusing $w/$W made the height formula divide by the resized width and SQUASHED every picture horizontally, wrecking the AI aim.',
+      '$iw = [Math]::Min(1600, $W); $ih = [int][Math]::Round($H * $iw / $W)',
+      '$out = New-Object System.Drawing.Bitmap $iw, $ih',
       '$g2 = [System.Drawing.Graphics]::FromImage($out)',
       "$g2.InterpolationMode = 'HighQualityBicubic'",
-      '$g2.DrawImage($bmp, 0, 0, $w, $h)',
+      '$g2.DrawImage($bmp, 0, 0, $iw, $ih)',
+      // Coordinate grid: thin red lines every 200 px of THIS picture, with
+      // yellow number labels every 400 px, so the AI can READ coordinates off
+      // the image instead of guessing them — the #1 cure for mis-clicks.
+      '$gp = New-Object System.Drawing.Pen -ArgumentList ([System.Drawing.Color]::FromArgb(120, 255, 60, 60))',
+      'for ($gx = 200; $gx -lt $iw; $gx += 200) { $g2.DrawLine($gp, $gx, 0, $gx, $ih) }',
+      'for ($gy = 200; $gy -lt $ih; $gy += 200) { $g2.DrawLine($gp, 0, $gy, $iw, $gy) }',
+      '$gf = New-Object System.Drawing.Font -ArgumentList "Arial", 14, ([System.Drawing.FontStyle]::Bold)',
+      '$gbs = New-Object System.Drawing.SolidBrush -ArgumentList ([System.Drawing.Color]::FromArgb(160, 0, 0, 0))',
+      '$gfs = New-Object System.Drawing.SolidBrush -ArgumentList ([System.Drawing.Color]::FromArgb(235, 255, 220, 60))',
+      'for ($gx = 400; $gx -lt $iw; $gx += 400) { $gtxt = [string]$gx; $gsz = $g2.MeasureString($gtxt, $gf); $g2.FillRectangle($gbs, $gx + 3, 3, $gsz.Width, $gsz.Height); $g2.DrawString($gtxt, $gf, $gfs, $gx + 3, 3) }',
+      'for ($gy = 400; $gy -lt $ih; $gy += 400) { $gtxt = [string]$gy; $gsz = $g2.MeasureString($gtxt, $gf); $g2.FillRectangle($gbs, 3, $gy + 3, $gsz.Width, $gsz.Height); $g2.DrawString($gtxt, $gf, $gfs, 3, $gy + 3) }',
       '$out.Save($env:GLUCER_OUT, [System.Drawing.Imaging.ImageFormat]::Jpeg)',
-      'Write-Output ("{0} {1} {2} {3} {4} {5} {6} {7}" -f $sel[0], $sel[1], $L, $T, $W, $H, $w, $h)'
+      'Write-Output ("{0} {1} {2} {3} {4} {5} {6} {7}" -f $sel[0], $sel[1], $L, $T, $W, $H, $iw, $ih)'
     ].join('\n');
     const out = await runCmd('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
       { env: Object.assign({}, process.env, { GLUCER_OUT: tmp, GLUCER_DISP: displayArg == null ? '' : String(displayArg) }), timeout: 60000 });
@@ -231,10 +243,10 @@ async function takeScreenshot(displayArg) {
   if (IS_ELECTRON) {
     const { desktopCapturer, screen } = require('electron');
     const displays = screen.getAllDisplays();
-    // More than one monitor (or a specific monitor asked for): photograph the
-    // exact monitor through Windows so the picture matches true desktop
-    // coordinates and the mouse can reach every display.
-    if (process.platform === 'win32' && (displays.length > 1 || (displayArg != null && Number(displayArg) >= 1))) {
+    // On Windows, ALWAYS photograph through Windows itself so every picture
+    // has the red coordinate grid, true physical coordinates and the monitor
+    // origin — that is what lets the mouse reach every display accurately.
+    if (process.platform === 'win32') {
       try { return await winCaptureMonitor(displayArg); } catch (e) {}
     }
     const d = screen.getPrimaryDisplay();
@@ -365,14 +377,40 @@ const GM_CSHARP = [
   '  [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, int d, UIntPtr e);',
   '}'
 ].join('\n');
-function mouseScript(x, y, actions) {
+function mouseScript(x, y, actions, shotPath) {
+  // Optional tail: after the click, photograph a small close-up around the
+  // click point (clamped inside the monitor the click belongs to) with a red
+  // cross on the exact spot, so the AI can SEE where it landed and correct
+  // itself if it missed.
+  let tail = ['Start-Sleep -Milliseconds 80'];
+  if (shotPath) {
+    const o = lastShot || {};
+    const hasMon = (Number(o.originX) || Number(o.originY)) && Number(o.screenW) > 0 && Number(o.screenH) > 0;
+    const crop = [
+      'Add-Type -AssemblyName System.Drawing',
+      '$ML = ' + (hasMon ? Math.round(Number(o.originX)) : 0) + '; $MT = ' + (hasMon ? Math.round(Number(o.originY)) : 0),
+      hasMon ? '$MW = ' + Math.round(Number(o.screenW)) + '; $MH = ' + Math.round(Number(o.screenH)) : '$MW = [GM]::GetSystemMetrics(0); $MH = [GM]::GetSystemMetrics(1)',
+      '$cw = [Math]::Min(400, $MW); $ch = [Math]::Min(250, $MH)',
+      '$bx = [Math]::Max($ML, [Math]::Min($ML + $MW - $cw, ' + Math.round(x) + ' - [int]($cw/2)))',
+      '$by = [Math]::Max($MT, [Math]::Min($MT + $MH - $ch, ' + Math.round(y) + ' - [int]($ch/2)))',
+      '$v = New-Object System.Drawing.Bitmap $cw, $ch',
+      '$vg = [System.Drawing.Graphics]::FromImage($v)',
+      '$vg.CopyFromScreen($bx, $by, 0, 0, (New-Object System.Drawing.Size($cw, $ch)))',
+      '$lx = ' + Math.round(x) + ' - $bx; $ly = ' + Math.round(y) + ' - $by',
+      '$vg.DrawLine([System.Drawing.Pens]::Red, $lx - 20, $ly, $lx + 20, $ly)',
+      '$vg.DrawLine([System.Drawing.Pens]::Red, $lx, $ly - 20, $lx, $ly + 20)',
+      '$vg.FillRectangle([System.Drawing.Brushes]::Red, $lx - 2, $ly - 2, 5, 5)',
+      '$v.Save($env:GLUCER_SHOT, [System.Drawing.Imaging.ImageFormat]::Jpeg)'
+    ];
+    tail = tail.concat(crop);
+  }
   // Multi-monitor pictures carry their monitor's true desktop position, so the
   // click process (which is DPI-aware) moves the cursor straight there — that
   // is what lets it reach the second monitor and monitors to the left.
   if (lastShot && (Number(lastShot.originX) || Number(lastShot.originY))) {
     return ["$src = @'", GM_CSHARP, "'@", 'Add-Type -TypeDefinition $src', '[void][GM]::SetProcessDPIAware()',
       '[void][GM]::SetCursorPos(' + Math.round(x) + ', ' + Math.round(y) + ')',
-      'Start-Sleep -Milliseconds 120', actions, 'Start-Sleep -Milliseconds 80'].join('\n');
+      'Start-Sleep -Milliseconds 120', actions].concat(tail).join('\n');
   }
   // Self-calibration: the process that clicks measures the real screen size
   // itself and rescales, so a wrong scale report from Electron (display
@@ -382,7 +420,7 @@ function mouseScript(x, y, actions) {
   return ["$src = @'", GM_CSHARP, "'@", 'Add-Type -TypeDefinition $src', '[void][GM]::SetProcessDPIAware()',
     '$sx = [double][GM]::GetSystemMetrics(0) / ' + eW + '; $sy = [double][GM]::GetSystemMetrics(1) / ' + eH,
     '[void][GM]::SetCursorPos([int][Math]::Round(' + x + ' * $sx), [int][Math]::Round(' + y + ' * $sy))',
-    'Start-Sleep -Milliseconds 120', actions, 'Start-Sleep -Milliseconds 80'].join('\n');
+    'Start-Sleep -Milliseconds 120', actions].concat(tail).join('\n');
 }
 const GT_CSHARP = [
   'using System;',
@@ -414,7 +452,13 @@ async function mouseClick(pos, btn) {
       : btn === 'double'
       ? '[GM]::mouse_event(2,0,0,0,[UIntPtr]::Zero); [GM]::mouse_event(4,0,0,0,[UIntPtr]::Zero); Start-Sleep -Milliseconds 70; [GM]::mouse_event(2,0,0,0,[UIntPtr]::Zero); [GM]::mouse_event(4,0,0,0,[UIntPtr]::Zero)'
       : '[GM]::mouse_event(2,0,0,0,[UIntPtr]::Zero); Start-Sleep -Milliseconds 50; [GM]::mouse_event(4,0,0,0,[UIntPtr]::Zero)';
-    await winPS(mouseScript(pos.cx, pos.cy, acts));
+    const tmp = path.join(os.tmpdir(), 'glucer-click-' + newId() + '.jpg');
+    try {
+      await winPS(mouseScript(pos.cx, pos.cy, acts, tmp), { GLUCER_SHOT: tmp });
+      let verify = null;
+      try { const b = fs.readFileSync(tmp); if (b.length) verify = { mime: 'image/jpeg', data: b.toString('base64') }; } catch (e) {}
+      return { verify };
+    } finally { try { fs.unlinkSync(tmp); } catch (e) {} }
   } else if (process.platform === 'darwin') {
     await runCmd('osascript', ['-e', 'tell application "System Events" to click at {' + pos.cx + ', ' + pos.cy + '}']);
   } else {
@@ -810,7 +854,7 @@ const TOOLS = {
       const image = await takeScreenshot(p.disp);
       if (image.imgW) lastShot = image;
       const monTxt = image.monCount > 1 ? ' — monitor ' + (image.mon || 1) + ' of ' + image.monCount : '';
-      return ok({ note: 'The screenshot is attached to this message as an image. Mouse tool coordinates are pixels in THIS picture (' + image.imgW + 'x' + image.imgH + ')' + monTxt + ', and clicking works on every monitor.', monitor: image.mon || 1, monitors: image.monCount || 1 }, 'Looked at your screen' + monTxt, { image });
+      return ok({ note: 'The screenshot is attached to this message as an image, with a red coordinate grid and yellow number labels drawn on it — read the x,y for mouse tools straight off those labels. Mouse tool coordinates are pixels in THIS picture (' + image.imgW + 'x' + image.imgH + ')' + monTxt + ', and clicking works on every monitor.', monitor: image.mon || 1, monitors: image.monCount || 1 }, 'Looked at your screen' + monTxt, { image });
     }
   },
 
@@ -1161,8 +1205,13 @@ const TOOLS = {
     run: async (a, p) => {
       const reAimed = await ensureShot();
       const pos = toScreen(p.ax, p.ay);
-      await mouseClick(pos, p.btn);
-      return ok({ x: pos.cx, y: pos.cy, button: p.btn }, 'Clicked ' + p.btn + ' at (' + pos.cx + ', ' + pos.cy + ')' + (reAimed ? ' (screen was re-checked just before, so the aim is current)' : ''));
+      const res = await mouseClick(pos, p.btn);
+      const v = res && res.verify;
+      return ok(
+        { x: pos.cx, y: pos.cy, button: p.btn, check: v ? 'A close-up is attached. The red cross marks EXACTLY where the click landed. If the cross is not on the thing you meant to click, take a fresh screenshot and click again with adjusted coordinates.' : 'No verification picture this time — take a screenshot to check the result.' },
+        'Clicked ' + p.btn + ' at (' + pos.cx + ', ' + pos.cy + ')' + (reAimed ? ' (screen was re-checked just before, so the aim is current)' : ''),
+        v ? { image: v } : undefined
+      );
     }
   },
 
