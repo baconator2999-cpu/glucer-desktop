@@ -151,13 +151,19 @@ async function takeScreenshot() {
   if (IS_ELECTRON) {
     const { desktopCapturer, screen } = require('electron');
     const d = screen.getPrimaryDisplay();
-    const w = Math.min(1600, Math.round(d.size.width * d.scaleFactor));
-    const h = Math.round(w * d.size.height / d.size.width);
+    const physW = Math.round(d.size.width * d.scaleFactor), physH = Math.round(d.size.height * d.scaleFactor);
+    const w = Math.min(1600, physW);
+    const h = Math.max(1, Math.round(w * physH / physW));
     const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: w, height: h } });
-    const src = sources.find((s) => s.display_id === String(d.id)) || sources[0];
+    // display_id is empty on some Windows drivers, so fall back to the source
+    // whose picture has the same shape as the primary display.
+    const aspect = physW / Math.max(1, physH);
+    const src = sources.find((s) => s.display_id === String(d.id)) ||
+      sources.find((s) => { const z = s.thumbnail.getSize(); return z.width > 0 && Math.abs(z.width / z.height - aspect) < 0.03; }) ||
+      sources[0];
     if (!src || src.thumbnail.isEmpty()) throw new Error('Could not capture the screen.');
     const size = src.thumbnail.getSize();
-    return { mime: 'image/jpeg', data: src.thumbnail.toJPEG(75).toString('base64'), imgW: size.width, imgH: size.height, screenW: Math.round(d.size.width * d.scaleFactor), screenH: Math.round(d.size.height * d.scaleFactor) };
+    return { mime: 'image/jpeg', data: src.thumbnail.toJPEG(75).toString('base64'), imgW: size.width, imgH: size.height, screenW: physW, screenH: physH, scale: d.scaleFactor, at: Date.now() };
   }
   const jpg = process.platform === 'win32' || process.platform === 'darwin';
   let shotDims = null; // [screenW, screenH, imgW, imgH]
@@ -202,7 +208,7 @@ async function takeScreenshot() {
     if (buf.length > 6 * 1024 * 1024) throw new Error('The screenshot is too large.');
     let imgW = shotDims ? shotDims[2] : 0, imgH = shotDims ? shotDims[3] : 0;
     if (!imgW && !jpg) { try { imgW = buf.readUInt32BE(16); imgH = buf.readUInt32BE(20); } catch (e) {} }
-    return { mime: jpg ? 'image/jpeg' : 'image/png', data: buf.toString('base64'), imgW: imgW || 0, imgH: imgH || 0, screenW: shotDims ? shotDims[0] : (imgW || 0), screenH: shotDims ? shotDims[1] : (imgH || 0) };
+    return { mime: jpg ? 'image/jpeg' : 'image/png', data: buf.toString('base64'), imgW: imgW || 0, imgH: imgH || 0, screenW: shotDims ? shotDims[0] : (imgW || 0), screenH: shotDims ? shotDims[1] : (imgH || 0), scale: 1, at: Date.now() };
   } finally { try { fs.unlinkSync(tmp); } catch (e) {} }
 }
 
@@ -236,13 +242,24 @@ function clipWrite(text) {
 function toScreen(x, y) {
   const nx = Number(x), ny = Number(y);
   if (!Number.isFinite(nx) || !Number.isFinite(ny)) throw new Error('Those coordinates are not numbers.');
-  if (!lastShot || !lastShot.imgW) throw new Error('Look at the screen first (call screenshot), then use coordinates from that picture.');
-  const cx = Math.max(0, Math.min(lastShot.screenW - 1, Math.round(nx * lastShot.screenW / lastShot.imgW)));
-  const cy = Math.max(0, Math.min(lastShot.screenH - 1, Math.round(ny * lastShot.screenH / lastShot.imgH)));
+  if (!lastShot || !lastShot.imgW) throw new Error('I could not check the screen to aim the mouse.');
+  // Mac clicking works in points, not pixels, so divide Retina captures down.
+  const divide = process.platform === 'darwin' && lastShot.scale > 1 ? lastShot.scale : 1;
+  const cx = Math.max(0, Math.min(Math.round(lastShot.screenW / divide) - 1, Math.round(nx * lastShot.screenW / lastShot.imgW / divide)));
+  const cy = Math.max(0, Math.min(Math.round(lastShot.screenH / divide) - 1, Math.round(ny * lastShot.screenH / lastShot.imgH / divide)));
   return { cx, cy };
 }
-function winPS(script) {
-  return runCmd('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], { timeout: 60000 });
+// Before any mouse action, if the last look at the screen is older than this,
+// silently re-capture it so the coordinates are aimed at the CURRENT screen.
+const SHOT_MAX_AGE = 8000;
+async function ensureShot() {
+  if (lastShot && lastShot.imgW && Date.now() - (lastShot.at || 0) <= SHOT_MAX_AGE) return false;
+  try { const img = await takeScreenshot(); if (img && img.imgW) { lastShot = img; return true; } } catch (e) {}
+  return false;
+}
+function winPS(script, extraEnv) {
+  return runCmd('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+    extraEnv ? { env: Object.assign({}, process.env, extraEnv), timeout: 60000 } : { timeout: 60000 });
 }
 const GM_CSHARP = [
   'using System;',
@@ -369,6 +386,132 @@ async function keyPress(c) {
   }
 }
 
+/* ---------- Window awareness (see and focus apps without pixel guessing) ---------- */
+const LW_CSHARP = [
+  'using System;',
+  'using System.Text;',
+  'using System.Collections.Generic;',
+  'using System.Runtime.InteropServices;',
+  'public class LW {',
+  '  public delegate bool P(IntPtr h, IntPtr l);',
+  '  [DllImport("user32.dll")] public static extern bool EnumWindows(P cb, IntPtr l);',
+  '  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);',
+  '  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder sb, int n);',
+  '  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);',
+  '  public static List<string> Get() {',
+  '    var outp = new List<string>();',
+  '    EnumWindows(delegate(IntPtr h, IntPtr l) {',
+  '      if (!IsWindowVisible(h)) return true;',
+  '      var sb = new StringBuilder(512);',
+  '      if (GetWindowText(h, sb, 512) < 1) return true;',
+  '      string t = sb.ToString();',
+  '      if (t == "Program Manager" || t == "Windows Input Experience" || t == "Microsoft Text Input Application") return true;',
+  '      outp.Add((IsIconic(h) ? "[minimized] " : "") + t);',
+  '      return true;',
+  '    }, IntPtr.Zero);',
+  '    return outp;',
+  '  }',
+  '}'
+].join('\n');
+const FW_CSHARP = [
+  'using System;',
+  'using System.Text;',
+  'using System.Runtime.InteropServices;',
+  'public class FW {',
+  '  public delegate bool P(IntPtr h, IntPtr l);',
+  '  [DllImport("user32.dll")] public static extern bool EnumWindows(P cb, IntPtr l);',
+  '  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);',
+  '  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder sb, int n);',
+  '  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);',
+  '  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);',
+  '  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);',
+  '  [DllImport("user32.dll")] public static extern void keybd_event(byte k, byte s, uint f, UIntPtr e);',
+  '  public static string Focus(string q) {',
+  '    IntPtr found = IntPtr.Zero; string title = "";',
+  '    string ql = q.ToLower();',
+  '    EnumWindows(delegate(IntPtr h, IntPtr l) {',
+  '      if (!IsWindowVisible(h)) return true;',
+  '      var sb = new StringBuilder(512);',
+  '      if (GetWindowText(h, sb, 512) < 1) return true;',
+  '      string t = sb.ToString();',
+  '      if (t.ToLower().Contains(ql)) { found = h; title = t; return false; }',
+  '      return true;',
+  '    }, IntPtr.Zero);',
+  '    if (found == IntPtr.Zero) return "NOTFOUND";',
+  '    if (IsIconic(found)) ShowWindow(found, 9);',
+  '    keybd_event(0x12, 0, 0, UIntPtr.Zero);',
+  '    SetForegroundWindow(found);',
+  '    keybd_event(0x12, 0, 2, UIntPtr.Zero);',
+  '    return "OK: " + title;',
+  '  }',
+  '}'
+].join('\n');
+async function listWindows() {
+  if (process.platform === 'win32') {
+    const script = ["$src = @'", LW_CSHARP, "'@", 'Add-Type -TypeDefinition $src', '[LW]::Get()'].join('\n');
+    const out = await winPS(script);
+    return out.split(/\r?\n/).map((s) => s.trim()).filter(Boolean).slice(0, 60);
+  }
+  if (process.platform === 'darwin') {
+    const lines = [
+      'tell application "System Events"',
+      'set outp to ""',
+      'repeat with p in (every application process whose visible is true)',
+      'repeat with w in (every window of p)',
+      'set outp to outp & (name of p) & ": " & (name of w) & linefeed',
+      'end repeat',
+      'end repeat',
+      'return outp',
+      'end tell'
+    ];
+    const out = await runCmd('osascript', lines.flatMap((l) => ['-e', l]));
+    return out.split(/\r?\n/).map((s) => s.trim()).filter(Boolean).slice(0, 60);
+  }
+  try {
+    const out = await runCmd('wmctrl', ['-l']);
+    return out.split(/\r?\n/).map((l) => l.split(/\s+/).slice(3).join(' ').trim()).filter(Boolean).slice(0, 60);
+  } catch (e) {
+    try {
+      const out = await runCmd('xdotool', ['search', '--onlyvisible', '--name', '', 'getwindowname', '%@']);
+      return out.split(/\r?\n/).map((s) => s.trim()).filter(Boolean).slice(0, 60);
+    } catch (e2) { throw new Error('Could not list windows. On Linux, Glucer needs the wmctrl or xdotool package installed.'); }
+  }
+}
+async function focusWindow(q) {
+  if (process.platform === 'win32') {
+    const script = ["$src = @'", FW_CSHARP, "'@", 'Add-Type -TypeDefinition $src', '[FW]::Focus($env:GLUCER_Q)'].join('\n');
+    const out = (await winPS(script, { GLUCER_Q: q })).trim();
+    if (out.startsWith('NOTFOUND')) throw new Error('No window with "' + q + '" in its title. Call list_windows to see the exact titles.');
+    return out.replace(/^OK: /, '');
+  }
+  if (process.platform === 'darwin') {
+    const lines = [
+      'on run argv',
+      'set q to (item 1 of argv)',
+      'tell application "System Events"',
+      'repeat with p in (every application process whose visible is true)',
+      'repeat with w in (every window of p)',
+      'if ((name of w) as string) contains q then',
+      'set frontmost of p to true',
+      'return ("OK: " & (name of w))',
+      'end if',
+      'end repeat',
+      'end repeat',
+      'set frontmost of (first application process whose name contains q) to true',
+      'return ("OK: " & q)',
+      'end tell',
+      'end run'
+    ];
+    const out = (await runCmd('osascript', lines.flatMap((l) => ['-e', l]).concat([q]))).trim();
+    return out.replace(/^OK: /, '');
+  }
+  try { await runCmd('wmctrl', ['-a', q]); return q; }
+  catch (e) {
+    try { await runCmd('xdotool', ['search', '--name', q, 'windowactivate', '--sync']); return q; }
+    catch (e2) { throw new Error('Could not focus that window. On Linux, Glucer needs the wmctrl or xdotool package installed.'); }
+  }
+}
+
 /* ---------- Tools ---------- */
 const SKIP = new Set(['node_modules', '.git', 'AppData', 'Library', '$Recycle.Bin', 'System Volume Information', 'Windows', 'Program Files', 'Program Files (x86)', '.cache', '.npm']);
 const BINARY_EXT = /^(png|jpe?g|gif|webp|ico|bmp|pdf|zip|rar|7z|gz|tar|exe|dll|msi|iso|dmg|mp3|mp4|mov|avi|mkv|wav|flac|ttf|otf|woff2?|bin|dat|db|sqlite|class|jar|so|dylib|docx|xlsx|pptx)$/i;
@@ -378,7 +521,7 @@ const BLOCKED = [
   /\b(rd|rmdir)\s+\/s.*\b[a-z]:\\?(\s|$)/i, /\bdel\s+.*\b[a-z]:\\\*?(\s|$)/i, /\bdiskpart\b/i, /\bshutdown\b/i, /:\(\)\s*\{/
 ];
 // Tools that only look. Read-only mode allows only these.
-const READ_OK_TOOLS = new Set(['system_info', 'list_folder', 'find_files', 'search_in_files', 'read_text_file', 'read_document', 'reveal_item', 'screenshot', 'clipboard_read', '__activity']);
+const READ_OK_TOOLS = new Set(['system_info', 'list_folder', 'find_files', 'search_in_files', 'read_text_file', 'read_document', 'reveal_item', 'screenshot', 'clipboard_read', 'list_windows', '__activity']);
 
 const TOOLS = {
   system_info: {
@@ -404,6 +547,27 @@ const TOOLS = {
       const image = await takeScreenshot();
       if (image.imgW) lastShot = image;
       return ok({ note: 'The screenshot is attached to this message as an image. Mouse tool coordinates are pixels in THIS picture (' + image.imgW + 'x' + image.imgH + ').' }, 'Looked at your screen', { image });
+    }
+  },
+
+  list_windows: {
+    plan: () => ({ lines: ['List the titles of the windows open on your screen'] }),
+    run: async () => {
+      const titles = await listWindows();
+      if (!titles.length) throw new Error('No open windows with titles were found.');
+      return ok({ windows: titles, count: titles.length }, 'Found ' + titles.length + ' open window' + (titles.length === 1 ? '' : 's'));
+    }
+  },
+
+  focus_window: {
+    plan: (a) => {
+      const q = String(a.title || '').trim();
+      if (!q) throw new Error('Say which window to focus (part of its title, like "Notepad").');
+      return { q, lines: ['Bring this window to the front: "' + q + '"'] };
+    },
+    run: async (a, p) => {
+      const t = await focusWindow(p.q);
+      return ok({ focused: t }, 'Focused "' + t + '" — the keyboard now types there');
     }
   },
 
@@ -704,13 +868,15 @@ const TOOLS = {
 
   mouse_click: {
     plan: (a) => {
-      const p = toScreen(a.x, a.y);
       const btn = ['left', 'right', 'double'].includes(a.button) ? a.button : 'left';
-      return { p, btn, lines: [(btn === 'double' ? 'DOUBLE-click' : 'Click the ' + btn.toUpperCase() + ' mouse button') + ' at screen position (' + p.cx + ', ' + p.cy + ')'] };
+      const p = (lastShot && lastShot.imgW) ? toScreen(a.x, a.y) : null;
+      return { btn, ax: a.x, ay: a.y, p, lines: [(btn === 'double' ? 'DOUBLE-click' : 'Click the ' + btn.toUpperCase() + ' mouse button') + (p ? ' at screen position (' + p.cx + ', ' + p.cy + ')' : ' on the screen')] };
     },
     run: async (a, p) => {
-      await mouseClick(p.p, p.btn);
-      return ok({ x: p.p.cx, y: p.p.cy, button: p.btn }, 'Clicked ' + p.btn + ' at (' + p.p.cx + ', ' + p.p.cy + ')');
+      const reAimed = await ensureShot();
+      const pos = toScreen(p.ax, p.ay);
+      await mouseClick(pos, p.btn);
+      return ok({ x: pos.cx, y: pos.cy, button: p.btn }, 'Clicked ' + p.btn + ' at (' + pos.cx + ', ' + pos.cy + ')' + (reAimed ? ' (screen was re-checked just before, so the aim is current)' : ''));
     }
   },
 
@@ -718,11 +884,13 @@ const TOOLS = {
     plan: (a) => {
       const dir = a.direction === 'up' ? 'up' : 'down';
       const n = Math.max(1, Math.min(10, Math.round(Number(a.clicks) || 3)));
-      const pos = (a.x != null && a.y != null) ? toScreen(a.x, a.y) : null;
-      return { dir, n, pos, lines: ['Scroll ' + dir + ' ' + n + ' notches' + (pos ? ' at (' + pos.cx + ', ' + pos.cy + ')' : ' where the mouse pointer is')] };
+      const pos = (a.x != null && a.y != null && lastShot && lastShot.imgW) ? toScreen(a.x, a.y) : null;
+      return { dir, n, ax: a.x, ay: a.y, pos, lines: ['Scroll ' + dir + ' ' + n + ' notches' + (pos ? ' at (' + pos.cx + ', ' + pos.cy + ')' : ' where the mouse pointer is')] };
     },
     run: async (a, p) => {
-      await mouseScroll(p.pos, p.dir, p.n);
+      let pos = p.pos;
+      if (p.ax != null && p.ay != null) { await ensureShot(); pos = toScreen(p.ax, p.ay); }
+      await mouseScroll(pos, p.dir, p.n);
       return ok({ direction: p.dir, clicks: p.n }, 'Scrolled ' + p.dir + ' ' + p.n + ' notches');
     }
   },
