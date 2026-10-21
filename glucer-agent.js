@@ -239,6 +239,44 @@ async function winCaptureMonitor(displayArg) {
     return { mime: 'image/jpeg', data: buf.toString('base64'), imgW: n[6], imgH: n[7], screenW: n[4], screenH: n[5], originX: n[2], originY: n[3], scale: 1, mon: n[0], monCount: n[1], at: Date.now() };
   } finally { try { fs.unlinkSync(tmp); } catch (e) {} }
 }
+/* Zoom: photograph an EXACT physical rectangle at native resolution (no
+   shrinking) with its own coordinate grid. Used by the screenshot_region tool
+   and by the automatic re-aim before clicks, so the AI aims on a sharp
+   close-up instead of the whole-desktop picture. Windows only. */
+async function winCaptureRect(L, T, W, H, srcShot) {
+  W = Math.max(120, Math.min(1400, Math.round(W)));
+  H = Math.max(90, Math.min(1000, Math.round(H)));
+  const tmp = path.join(os.tmpdir(), 'glucer-zoom-' + newId() + '.jpg');
+  try {
+    const script = [
+      "Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public class GD { [DllImport(\"user32.dll\")] public static extern bool SetProcessDPIAware(); }'",
+      '[void][GD]::SetProcessDPIAware()',
+      'Add-Type -AssemblyName System.Windows.Forms,System.Drawing',
+      '$L = ' + Math.round(L) + '; $T = ' + Math.round(T) + '; $W = ' + W + '; $H = ' + H,
+      '$bmp = New-Object System.Drawing.Bitmap $W, $H',
+      '$g = [System.Drawing.Graphics]::FromImage($bmp)',
+      '$g.CopyFromScreen($L, $T, 0, 0, (New-Object System.Drawing.Size($W, $H)))',
+      '# Grid on the close-up too: 100 px lines, labels every 200 px, counting from the close-up own top-left corner.',
+      '$gp = New-Object System.Drawing.Pen -ArgumentList ([System.Drawing.Color]::FromArgb(120, 255, 60, 60))',
+      'for ($gx = 100; $gx -lt $W; $gx += 100) { $g.DrawLine($gp, $gx, 0, $gx, $H) }',
+      'for ($gy = 100; $gy -lt $H; $gy += 100) { $g.DrawLine($gp, 0, $gy, $W, $gy) }',
+      '$gf = New-Object System.Drawing.Font -ArgumentList "Arial", 12, ([System.Drawing.FontStyle]::Bold)',
+      '$gbs = New-Object System.Drawing.SolidBrush -ArgumentList ([System.Drawing.Color]::FromArgb(160, 0, 0, 0))',
+      '$gfs = New-Object System.Drawing.SolidBrush -ArgumentList ([System.Drawing.Color]::FromArgb(235, 255, 220, 60))',
+      'for ($gx = 200; $gx -lt $W; $gx += 200) { $gtxt = [string]$gx; $gsz = $g.MeasureString($gtxt, $gf); $g.FillRectangle($gbs, $gx + 3, 3, $gsz.Width, $gsz.Height); $g.DrawString($gtxt, $gf, $gfs, $gx + 3, 3) }',
+      'for ($gy = 200; $gy -lt $H; $gy += 200) { $gtxt = [string]$gy; $gsz = $g.MeasureString($gtxt, $gf); $g.FillRectangle($gbs, 3, $gy + 3, $gsz.Width, $gsz.Height); $g.DrawString($gtxt, $gf, $gfs, 3, $gy + 3) }',
+      '$bmp.Save($env:GLUCER_OUT, [System.Drawing.Imaging.ImageFormat]::Jpeg)',
+      'Write-Output ("{0} {1}" -f $W, $H)'
+    ].join('\n');
+    const out = await runCmd('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+      { env: Object.assign({}, process.env, { GLUCER_OUT: tmp }), timeout: 60000 });
+    const n = out.trim().split(/\s+/).map(Number);
+    if (n.length < 2 || !n.every(Number.isFinite)) throw new Error('bad zoom output');
+    const buf = fs.readFileSync(tmp);
+    if (!buf.length) throw new Error('The zoom picture came out empty.');
+    return { mime: 'image/jpeg', data: buf.toString('base64'), imgW: n[0], imgH: n[1], screenW: n[0], screenH: n[1], originX: Math.round(L), originY: Math.round(T), scale: 1, mon: (srcShot && srcShot.mon) || 1, monCount: (srcShot && srcShot.monCount) || 1, region: true, at: Date.now() };
+  } finally { try { fs.unlinkSync(tmp); } catch (e) {} }
+}
 async function takeScreenshot(displayArg) {
   if (IS_ELECTRON) {
     const { desktopCapturer, screen } = require('electron');
@@ -358,9 +396,15 @@ function toScreen(x, y) {
 const SHOT_MAX_AGE = 8000;
 async function ensureShot() {
   if (lastShot && lastShot.imgW && Date.now() - (lastShot.at || 0) <= SHOT_MAX_AGE) return false;
-  // Re-capture the SAME monitor the last picture came from — the coordinates
-  // the AI is aiming with belong to that picture.
-  try { const img = await takeScreenshot(lastShot && lastShot.monCount > 1 ? lastShot.mon : undefined); if (img && img.imgW) { lastShot = img; return true; } } catch (e) {}
+  // Re-capture the SAME view the AI is aiming with: a zoomed region stays the
+  // SAME exact rectangle (its coordinates are crop-local), and a monitor shot
+  // re-shoots that monitor — never swap one for the other mid-task.
+  try {
+    const img = lastShot && lastShot.region
+      ? await winCaptureRect(lastShot.originX, lastShot.originY, lastShot.screenW, lastShot.screenH, lastShot)
+      : await takeScreenshot(lastShot && lastShot.monCount > 1 ? lastShot.mon : undefined);
+    if (img && img.imgW) { lastShot = img; return true; }
+  } catch (e) {}
   return false;
 }
 function winPS(script, extraEnv) {
@@ -385,7 +429,7 @@ function mouseScript(x, y, actions, shotPath) {
   let tail = ['Start-Sleep -Milliseconds 80'];
   if (shotPath) {
     const o = lastShot || {};
-    const hasMon = (Number(o.originX) || Number(o.originY)) && Number(o.screenW) > 0 && Number(o.screenH) > 0;
+    const hasMon = o.region || (Number(o.originX) || Number(o.originY)) && Number(o.screenW) > 0 && Number(o.screenH) > 0;
     const crop = [
       'Add-Type -AssemblyName System.Drawing',
       '$ML = ' + (hasMon ? Math.round(Number(o.originX)) : 0) + '; $MT = ' + (hasMon ? Math.round(Number(o.originY)) : 0),
@@ -404,10 +448,11 @@ function mouseScript(x, y, actions, shotPath) {
     ];
     tail = tail.concat(crop);
   }
-  // Multi-monitor pictures carry their monitor's true desktop position, so the
-  // click process (which is DPI-aware) moves the cursor straight there — that
-  // is what lets it reach the second monitor and monitors to the left.
-  if (lastShot && (Number(lastShot.originX) || Number(lastShot.originY))) {
+  // Multi-monitor and zoomed pictures both carry their true desktop position
+  // (lastShot.region marks a zoom), so the click process (which is DPI-aware)
+  // moves the cursor straight there — a zoomed crop at desktop position 0,0
+  // must ALSO take this branch or its coordinates would be rescaled 5-8x.
+  if (lastShot && (lastShot.region || Number(lastShot.originX) || Number(lastShot.originY))) {
     return ["$src = @'", GM_CSHARP, "'@", 'Add-Type -TypeDefinition $src', '[void][GM]::SetProcessDPIAware()',
       '[void][GM]::SetCursorPos(' + Math.round(x) + ', ' + Math.round(y) + ')',
       'Start-Sleep -Milliseconds 120', actions].concat(tail).join('\n');
@@ -827,7 +872,7 @@ const BLOCKED = [
   /\b(rd|rmdir)\s+\/s.*\b[a-z]:\\?(\s|$)/i, /\bdel\s+.*\b[a-z]:\\\*?(\s|$)/i, /\bdiskpart\b/i, /\bshutdown\b/i, /:\(\)\s*\{/
 ];
 // Tools that only look. Read-only mode allows only these.
-const READ_OK_TOOLS = new Set(['system_info', 'list_folder', 'find_files', 'search_in_files', 'read_text_file', 'read_document', 'reveal_item', 'screenshot', 'clipboard_read', 'list_windows', 'list_elements', '__activity']);
+const READ_OK_TOOLS = new Set(['system_info', 'list_folder', 'find_files', 'search_in_files', 'read_text_file', 'read_document', 'reveal_item', 'screenshot', 'screenshot_region', 'clipboard_read', 'list_windows', 'list_elements', '__activity']);
 
 const TOOLS = {
   system_info: {
@@ -854,7 +899,34 @@ const TOOLS = {
       const image = await takeScreenshot(p.disp);
       if (image.imgW) lastShot = image;
       const monTxt = image.monCount > 1 ? ' — monitor ' + (image.mon || 1) + ' of ' + image.monCount : '';
-      return ok({ note: 'The screenshot is attached to this message as an image, with a red coordinate grid and yellow number labels drawn on it — read the x,y for mouse tools straight off those labels. Mouse tool coordinates are pixels in THIS picture (' + image.imgW + 'x' + image.imgH + ')' + monTxt + ', and clicking works on every monitor.', monitor: image.mon || 1, monitors: image.monCount || 1 }, 'Looked at your screen' + monTxt, { image });
+      return ok({ note: 'The screenshot is attached to this message as an image, with a red coordinate grid and yellow number labels drawn on it — read the x,y for mouse tools straight off those labels. Mouse tool coordinates are pixels in THIS picture (' + image.imgW + 'x' + image.imgH + ')' + monTxt + ', and clicking works on every monitor. For small targets, zoom in with screenshot_region before clicking.', monitor: image.mon || 1, monitors: image.monCount || 1 }, 'Looked at your screen' + monTxt, { image });
+    }
+  },
+
+  screenshot_region: {
+    plan: (a) => {
+      if (process.platform !== 'win32') throw new Error('Zooming into a region is only supported on Windows for now. Use the regular screenshot instead.');
+      if (!lastShot || !lastShot.imgW) throw new Error('Take a full screenshot first, then zoom into it.');
+      const x = Number(a.x), y = Number(a.y);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error('Give the center of the area to zoom into as x,y — pixels in the last picture.');
+      const w = Math.max(160, Math.min(1400, Math.round(Number(a.width) || 500)));
+      const h = Math.max(120, Math.min(1000, Math.round(Number(a.height) || 350)));
+      return { x, y, w, h, risk: 'high', lines: ['Zoom into the screen around (' + Math.round(x) + ', ' + Math.round(y) + ') to see it at full resolution', 'The picture is sent to the AI service to answer you. Close anything private first.'] };
+    },
+    run: async (a, p) => {
+      const src = lastShot;
+      const sx = Number(src.screenW) / Math.max(1, Number(src.imgW));
+      const sy = Number(src.screenH) / Math.max(1, Number(src.imgH));
+      const pcx = (Number(src.originX) || 0) + Math.round(p.x * sx);
+      const pcy = (Number(src.originY) || 0) + Math.round(p.y * sy);
+      const pw = Math.max(120, Math.round(p.w * sx)), ph = Math.max(90, Math.round(p.h * sy));
+      const mL = Number(src.originX) || 0, mT = Number(src.originY) || 0;
+      const mW = Math.max(120, Number(src.screenW) || 0), mH = Math.max(90, Number(src.screenH) || 0);
+      const L = Math.max(mL, Math.min(mL + mW - pw, pcx - Math.round(pw / 2)));
+      const T = Math.max(mT, Math.min(mT + mH - ph, pcy - Math.round(ph / 2)));
+      const img = await winCaptureRect(L, T, pw, ph, src);
+      lastShot = img;
+      return ok({ note: 'A sharp close-up is attached with its own coordinate grid. Its yellow labels count from the close-up\'s OWN top-left corner, and mouse tool coordinates are pixels in THIS picture — click using these labels for pinpoint accuracy.', zoomed: true }, 'Zoomed in around (' + Math.round(p.x) + ', ' + Math.round(p.y) + ')', { image: img });
     }
   },
 
