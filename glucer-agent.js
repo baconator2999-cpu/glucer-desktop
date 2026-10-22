@@ -198,12 +198,33 @@ const GMON_CSHARP = [
   '  }',
   '}'
 ].join('\n');
+/* Speed: every PowerShell spawn used to re-compile its C# helper from source
+   (1-3 s each time, paid on EVERY click, key press and screenshot). Now each
+   helper is compiled ONCE into a small DLL in %TEMP% and simply loaded on
+   later calls, so every action starts seconds faster. The DLL name embeds a
+   hash of the C# source, so an updated app always recompiles cleanly. */
+function asmProlog(key, className, cs, refs) {
+  const hash = crypto.createHash('sha256').update(cs).digest('hex').slice(0, 12);
+  const refA = refs ? ' -ReferencedAssemblies ' + refs : '';
+  return [
+    "$gsrc = @'", cs, "'@",
+    "$gdir = Join-Path $env:TEMP 'glucer-asm'; New-Item -ItemType Directory -Force -Path $gdir | Out-Null",
+    "$gdll = Join-Path $gdir '" + key + '-' + hash + ".dll'",
+    "if (-not ('" + className + "' -as [type])) {",
+    "  $gok = $false",
+    "  if (Test-Path $gdll) { try { [void][Reflection.Assembly]::LoadFrom($gdll); $gok = $true } catch {} }",
+    "  if (-not $gok) { try { Add-Type -TypeDefinition $gsrc" + refA + " -OutputAssembly $gdll -ErrorAction Stop } catch { Add-Type -TypeDefinition $gsrc" + refA + " } }",
+    "  if (-not ('" + className + "' -as [type])) { Add-Type -TypeDefinition $gsrc" + refA + " }",
+    "}"
+  ];
+}
+const GD_CSHARP = 'using System.Runtime.InteropServices; public class GD { [DllImport("user32.dll")] public static extern bool SetProcessDPIAware(); }';
+
 async function winCaptureMonitor(displayArg) {
   const tmp = path.join(os.tmpdir(), 'glucer-shot-' + newId() + '.jpg');
   try {
     const script = [
-      "$src = @'", GMON_CSHARP, "'@",
-      'Add-Type -TypeDefinition $src',
+      ...asmProlog('gmon', 'GMON', GMON_CSHARP),
       "$sel = ([GMON]::Select($env:GLUCER_DISP) -split '\\s+')",
       '$L = [int]$sel[2]; $T = [int]$sel[3]; $W = [int]$sel[4]; $H = [int]$sel[5]',
       'Add-Type -AssemblyName System.Windows.Forms,System.Drawing',
@@ -249,7 +270,7 @@ async function winCaptureRect(L, T, W, H, srcShot) {
   const tmp = path.join(os.tmpdir(), 'glucer-zoom-' + newId() + '.jpg');
   try {
     const script = [
-      "Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public class GD { [DllImport(\"user32.dll\")] public static extern bool SetProcessDPIAware(); }'",
+      ...asmProlog('gd', 'GD', GD_CSHARP),
       '[void][GD]::SetProcessDPIAware()',
       'Add-Type -AssemblyName System.Windows.Forms,System.Drawing',
       '$L = ' + Math.round(L) + '; $T = ' + Math.round(T) + '; $W = ' + W + '; $H = ' + H,
@@ -453,24 +474,21 @@ function mouseScript(x, y, actions, shotPath) {
   // moves the cursor straight there — a zoomed crop at desktop position 0,0
   // must ALSO take this branch or its coordinates would be rescaled 5-8x.
   if (lastShot && (lastShot.region || Number(lastShot.originX) || Number(lastShot.originY))) {
-    return ["$src = @'", GM_CSHARP, "'@", 'Add-Type -TypeDefinition $src', '[void][GM]::SetProcessDPIAware()',
+    return asmProlog('gm', 'GM', GM_CSHARP).concat(['[void][GM]::SetProcessDPIAware()',
       '[void][GM]::SetCursorPos(' + Math.round(x) + ', ' + Math.round(y) + ')',
-      'Start-Sleep -Milliseconds 120', actions].concat(tail).join('\n');
+      'Start-Sleep -Milliseconds 120', actions], tail).join('\n');
   }
   // Self-calibration: the process that clicks measures the real screen size
   // itself and rescales, so a wrong scale report from Electron (display
   // scaling, mixed DPI) can never steer the cursor to the wrong place.
   const eW = Math.max(1, (lastShot && lastShot.screenW) || 0);
   const eH = Math.max(1, (lastShot && lastShot.screenH) || 0);
-  return ["$src = @'", GM_CSHARP, "'@", 'Add-Type -TypeDefinition $src', '[void][GM]::SetProcessDPIAware()',
+  return asmProlog('gm', 'GM', GM_CSHARP).concat(['[void][GM]::SetProcessDPIAware()',
     '$sx = [double][GM]::GetSystemMetrics(0) / ' + eW + '; $sy = [double][GM]::GetSystemMetrics(1) / ' + eH,
     '[void][GM]::SetCursorPos([int][Math]::Round(' + x + ' * $sx), [int][Math]::Round(' + y + ' * $sy))',
-    'Start-Sleep -Milliseconds 120', actions].concat(tail).join('\n');
+    'Start-Sleep -Milliseconds 120', actions], tail).join('\n');
 }
-const GT_CSHARP = [
-  'using System;',
-  'using System.Runtime.InteropServices;',
-  'using System.Threading;',
+const GT_BODY = [
   'public class GT {',
   '  [StructLayout(LayoutKind.Sequential)] public struct MOUSEINPUT { public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }',
   '  [StructLayout(LayoutKind.Sequential)] public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }',
@@ -490,6 +508,7 @@ const GT_CSHARP = [
   '  }',
   '}'
 ].join('\n');
+const GT_CSHARP = ['using System;', 'using System.Runtime.InteropServices;', 'using System.Threading;', GT_BODY].join('\n');
 async function mouseClick(pos, btn) {
   if (process.platform === 'win32') {
     const acts = btn === 'right'
@@ -517,7 +536,7 @@ async function mouseScroll(pos, dir, clicks) {
   if (process.platform === 'win32') {
     const scroll = '[GM]::mouse_event(0x0800,0,0,' + delta + ',[UIntPtr]::Zero)';
     if (pos) await winPS(mouseScript(pos.cx, pos.cy, scroll));
-    else await winPS(["$src = @'", GM_CSHARP, "'@", 'Add-Type -TypeDefinition $src', '[void][GM]::SetProcessDPIAware()', 'Start-Sleep -Milliseconds 50', scroll].join('\n'));
+    else await winPS(asmProlog('gm', 'GM', GM_CSHARP).concat(['[void][GM]::SetProcessDPIAware()', 'Start-Sleep -Milliseconds 50', scroll]).join('\n'));
   } else if (process.platform === 'darwin') {
     throw new Error('Scrolling is not supported on the Mac yet.');
   } else {
@@ -528,9 +547,9 @@ async function mouseScroll(pos, dir, clicks) {
 async function keyboardType(text) {
   if (process.platform === 'win32') {
     const b64 = Buffer.from(text, 'utf8').toString('base64');
-    const script = ["$src = @'", GT_CSHARP, "'@", 'Add-Type -TypeDefinition $src',
+    const script = asmProlog('gt', 'GT', GT_CSHARP).concat([
       "$text = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + b64 + "'))",
-      '[void][GT]::TypeText($text)'].join('\n');
+      '[void][GT]::TypeText($text)']).join('\n');
     await winPS(script);
   } else if (process.platform === 'darwin') {
     await runCmd('osascript', ['-e', 'on run argv', '-e', 'tell application "System Events" to keystroke (item 1 of argv)', '-e', 'end run', text]);
@@ -660,7 +679,7 @@ const FW_CSHARP = [
 ].join('\n');
 async function listWindows() {
   if (process.platform === 'win32') {
-    const script = ["$src = @'", LW_CSHARP, "'@", 'Add-Type -TypeDefinition $src', '[LW]::Get()'].join('\n');
+    const script = asmProlog('lw', 'LW', LW_CSHARP).concat(['[LW]::Get()']).join('\n');
     const out = await winPS(script);
     return out.split(/\r?\n/).map((s) => s.trim()).filter(Boolean).slice(0, 60);
   }
@@ -691,7 +710,7 @@ async function listWindows() {
 }
 async function focusWindow(q) {
   if (process.platform === 'win32') {
-    const script = ["$src = @'", FW_CSHARP, "'@", 'Add-Type -TypeDefinition $src', '[FW]::Focus($env:GLUCER_Q)'].join('\n');
+    const script = asmProlog('fw', 'FW', FW_CSHARP).concat(['[FW]::Focus($env:GLUCER_Q)']).join('\n');
     const out = (await winPS(script, { GLUCER_Q: q })).trim();
     if (out.startsWith('NOTFOUND')) throw new Error('No window with "' + q + '" in its title. Call list_windows to see the exact titles.');
     return out.replace(/^OK: /, '');
@@ -724,20 +743,35 @@ async function focusWindow(q) {
   }
 }
 
-/* ---------- Click by NAME (UI Automation — exact, never misses) ---------- */
-/* Asks the app itself where its button is, instead of aiming pixels at a
-   screenshot. Works on every app that exposes accessibility info (most do). */
+/* ---------- Click by NAME v2 (UI Automation — exact, fast, self-correcting) ---------- */
+/* Asks the app itself where its control is instead of aiming pixels at a
+   screenshot. v2 upgrades: fuzzy name matching (exact > prefix > contains,
+   also AutomationId), searches EVERY open window (no focus_window needed),
+   presses the control with its own automation pattern (Invoke/Toggle/Expand/
+   Select work even off-screen), scrolls it into view first, and — when the
+   name is not found — returns the REAL control names around it so the very
+   next call succeeds without any screenshot. type_text focuses the control
+   and types into it in the same call (click + type in one step). */
 const UIA_CSHARP = [
   'using System;',
   'using System.Collections.Generic;',
   'using System.Runtime.InteropServices;',
+  'using System.Text;',
   'using System.Threading;',
   'using System.Windows.Automation;',
+  GT_BODY,
   'public class UIA {',
   '  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();',
   '  [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);',
   '  [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, int d, UIntPtr e);',
   '  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();',
+  '  static string Name(AutomationElement e) { try { return e.Current.Name; } catch (Exception) { return null; } }',
+  '  static string Kind(AutomationElement e) { try { return e.Current.ControlType.ProgrammaticName.Replace("ControlType.", ""); } catch (Exception) { return ""; } }',
+  '  static bool OnScreen(AutomationElement e) { try { return !e.Current.IsOffscreen; } catch (Exception) { return true; } }',
+  '  static bool Usable(AutomationElement e) { try { return e.Current.IsEnabled; } catch (Exception) { return true; } }',
+  '  static void ScrollIn(AutomationElement e) {',
+  '    try { var s = e.GetCurrentPattern(ScrollItemPattern.Pattern) as ScrollItemPattern; if (s != null) s.ScrollIntoView(); } catch (Exception) {}',
+  '  }',
   '  static AutomationElement Root() {',
   '    SetProcessDPIAware();',
   '    IntPtr h = GetForegroundWindow();',
@@ -745,47 +779,117 @@ const UIA_CSHARP = [
   '    try { return AutomationElement.FocusedWindow; } catch (Exception) {}',
   '    return AutomationElement.RootElement;',
   '  }',
-  '  static string Label(AutomationElement e) {',
-  '    string t = "";',
-  '    try { t = e.Current.Name; } catch (Exception) {}',
-  '    string c = "";',
-  '    try { c = e.Current.ControlType.ProgrammaticName.Replace("ControlType.", ""); } catch (Exception) {}',
-  '    return c + ": " + (t == null ? "" : t);',
-  '  }',
-  '  static AutomationElement Walk(AutomationElement p, string ql, int depth) {',
-  '    if (p == null || depth > 9) return null;',
+  '  public class Cand { public AutomationElement el; public string name; public string kind; public int score; }',
+  '  static void Search(AutomationElement win, string ql, string kind, List<Cand> found) {',
   '    AutomationElementCollection kids;',
-  '    try { kids = p.FindAll(TreeScope.Children, Condition.TrueCondition); } catch (Exception) { return null; }',
+  '    var cond = new PropertyCondition(AutomationElement.IsControlElementProperty, true);',
+  '    try { kids = win.FindAll(TreeScope.Descendants, cond); } catch (Exception) { return; }',
+  '    int seen = 0;',
   '    foreach (AutomationElement k in kids) {',
-  '      string n = null;',
-  '      try { n = k.Current.Name; } catch (Exception) {}',
-  '      if (!string.IsNullOrEmpty(n) && n.ToLower().Contains(ql)) return k;',
-  '      var deep = Walk(k, ql, depth + 1);',
-  '      if (deep != null) return deep;',
+  '      if (++seen > 3000) break;',
+  '      string n = Name(k);',
+  '      if (string.IsNullOrEmpty(n)) continue;',
+  '      string nl = n.ToLower();',
+  '      string aid = "";',
+  '      try { aid = (k.Current.AutomationId ?? "").ToLower(); } catch (Exception) {}',
+  '      int s = -1;',
+  '      if (nl == ql) s = 100;',
+  '      else if (nl.StartsWith(ql)) s = 80;',
+  '      else if (nl.Contains(ql)) s = 60;',
+  '      else if (aid == ql) s = 95;',
+  '      else if (aid.Length > 2 && aid.Contains(ql)) s = 50;',
+  '      if (s < 0) continue;',
+  '      string kd = Kind(k);',
+  '      if (!string.IsNullOrEmpty(kind) && !kd.ToLower().StartsWith(kind)) continue;',
+  '      if (!Usable(k)) s -= 40;',
+  '      if (!OnScreen(k)) s -= 20;',
+  '      if (s > 0) found.Add(new Cand { el = k, name = n, kind = kd, score = s });',
   '    }',
-  '    return null;',
   '  }',
-  '  public static string Click(string name, string kind) {',
-  '    var root = Root();',
-  '    if (root == null) return "ERR: no active window to click in.";',
-  '    AutomationElement el = null;',
-  '    try { el = root.FindFirst(TreeScope.Descendants, new PropertyCondition(AutomationElement.NameProperty, name, PropertyConditionFlags.IgnoreCase)); } catch (Exception) {}',
-  '    if (el == null) el = Walk(root, name.ToLower(), 0);',
-  '    if (el == null) return "ERR: no element with that name in the active window. Call list_elements to see the exact names.";',
-  '    if (!string.IsNullOrEmpty(kind)) {',
-  '      try {',
-  '        string ct = el.Current.ControlType.ProgrammaticName.Replace("ControlType.", "");',
-  '        if (!ct.ToLower().StartsWith(kind.ToLower())) return "ERR: the name matched a " + ct + ", not a " + kind + ". Try list_elements and be more specific.";',
-  '      } catch (Exception) {}',
+  '  static string WindowTitle(AutomationElement e) {',
+  '    try {',
+  '      AutomationElement w = e;',
+  '      for (int i = 0; i < 30; i++) {',
+  '        AutomationElement p = TreeWalker.ControlViewWalker.GetParent(w);',
+  '        if (p == null || p == AutomationElement.RootElement) break;',
+  '        w = p;',
+  '      }',
+  '      return Name(w) ?? "";',
+  '    } catch (Exception) { return ""; }',
+  '  }',
+  '  static void CollectNames(AutomationElement p, int depth, List<string> outp) {',
+  '    if (p == null || depth > 8 || outp.Count >= 10) return;',
+  '    AutomationElementCollection kids;',
+  '    try { kids = p.FindAll(TreeScope.Children, Condition.TrueCondition); } catch (Exception) { return; }',
+  '    foreach (AutomationElement k in kids) {',
+  '      string n = Name(k);',
+  '      string kd = Kind(k).ToLower();',
+  '      bool clickable = kd.Contains("button") || kd.Contains("menu") || kd.Contains("item") || kd.Contains("hyperlink") || kd.Contains("check") || kd.Contains("radio") || kd.Contains("combo") || kd.Contains("tab") || kd.Contains("edit");',
+  '      if (!string.IsNullOrEmpty(n) && clickable && kd != "tooltip") {',
+  '        string one = Kind(k) + " \'" + n + "\'";',
+  '        if (!outp.Contains(one)) outp.Add(one);',
+  '      }',
+  '      if (outp.Count >= 10) return;',
+  '      CollectNames(k, depth + 1, outp);',
   '    }',
+  '  }',
+  '  static string Act(AutomationElement el) {',
+  '    object p;',
+  '    try { p = el.GetCurrentPattern(InvokePattern.Pattern); if (p is InvokePattern) { ((InvokePattern)p).Invoke(); return "invoked"; } } catch (Exception) {}',
+  '    try { p = el.GetCurrentPattern(TogglePattern.Pattern); if (p is TogglePattern) { ((TogglePattern)p).Toggle(); return "toggled"; } } catch (Exception) {}',
+  '    try { p = el.GetCurrentPattern(ExpandCollapsePattern.Pattern); if (p is ExpandCollapsePattern) { ((ExpandCollapsePattern)p).Expand(); return "expanded"; } } catch (Exception) {}',
+  '    try { p = el.GetCurrentPattern(SelectionItemPattern.Pattern); if (p is SelectionItemPattern) { ((SelectionItemPattern)p).Select(); return "selected"; } } catch (Exception) {}',
+  '    try { p = el.GetCurrentPattern(LegacyIAccessiblePattern.Pattern); if (p is LegacyIAccessiblePattern) { ((LegacyIAccessiblePattern)p).DoDefaultAction(); return "pressed"; } } catch (Exception) {}',
   '    double x = 0, y = 0; bool got = false;',
   '    try { var pt = el.GetClickablePoint(); x = pt.X; y = pt.Y; got = true; } catch (Exception) {}',
   '    if (!got) { try { var r = el.Current.BoundingRectangle; x = r.X + r.Width / 2; y = r.Y + r.Height / 2; got = r.Width > 0 && r.Height > 0; } catch (Exception) {} }',
-  '    if (!got) return "ERR: that element has no position on screen. Take a screenshot and use mouse_click instead.";',
+  '    if (!got) return null;',
   '    SetCursorPos((int)x, (int)y);',
   '    Thread.Sleep(120);',
   '    mouse_event(2, 0, 0, 0, UIntPtr.Zero); Thread.Sleep(40); mouse_event(4, 0, 0, 0, UIntPtr.Zero);',
-  '    return "OK clicked " + Label(el) + " at (" + (int)x + ", " + (int)y + ")";',
+  '    return "clicked at (" + (int)x + ", " + (int)y + ")";',
+  '  }',
+  '  public static string Click(string name, string kind, string typeText) {',
+  '    SetProcessDPIAware();',
+  '    string ql = (name ?? "").Trim().ToLower();',
+  '    if (ql.Length == 0) return "ERR: no name given.";',
+  '    var found = new List<Cand>();',
+  '    AutomationElement fg = null;',
+  '    try { IntPtr h = GetForegroundWindow(); if (h != IntPtr.Zero) fg = AutomationElement.FromHandle(h); } catch (Exception) {}',
+  '    if (fg == null) { try { fg = AutomationElement.FocusedWindow; } catch (Exception) {} }',
+  '    if (fg != null) Search(fg, ql, kind, found);',
+  '    if (found.Count == 0) {',
+  '      try {',
+  '        var tops = AutomationElement.RootElement.FindAll(TreeScope.Children, Condition.TrueCondition);',
+  '        int scanned = 0;',
+  '        foreach (AutomationElement w in tops) {',
+  '          if (++scanned > 20) break;',
+  '          if (fg != null && w.Current.NativeWindowHandle == fg.Current.NativeWindowHandle) continue;',
+  '          string wn = Name(w) ?? "";',
+  '          if (wn == "" || wn == "Program Manager") continue;',
+  '          Search(w, ql, kind, found);',
+  '          if (found.Count > 0) break;',
+  '        }',
+  '      } catch (Exception) {}',
+  '    }',
+  '    if (found.Count == 0) {',
+  '      var names = new List<string>();',
+  '      CollectNames(fg, 0, names);',
+  '      string hint = names.Count > 0 ? " The real controls in the active window are: " + string.Join("; ", names) + "." : "";',
+  '      return "ERR: no control" + (string.IsNullOrEmpty(kind) ? "" : " of kind " + kind) + " named \'" + name + "\' in any open window." + hint + " Retry click_element with one of those exact names - no screenshot needed.";',
+  '    }',
+  '    found.Sort((a, b) => b.score.CompareTo(a.score));',
+  '    Cand best = found[0];',
+  '    ScrollIn(best.el);',
+  '    if (!string.IsNullOrEmpty(typeText)) {',
+  '      try { best.el.SetFocus(); } catch (Exception) {}',
+  '      Thread.Sleep(250);',
+  '      string typed = GT.TypeText(typeText);',
+  '      return "OK focused " + best.kind + " \'" + best.name + "\' in window \'" + WindowTitle(best.el) + "\' and " + typed;',
+  '    }',
+  '    string how = Act(best.el);',
+  '    if (how == null) return "ERR: found " + best.kind + " \'" + best.name + "\' but it has no clickable position. Take a screenshot and use mouse_click instead.";',
+  '    return "OK " + how + " " + best.kind + " \'" + best.name + "\' in window \'" + WindowTitle(best.el) + "\'";',
   '  }',
   '  static void Collect(AutomationElement p, int depth, List<string> outp) {',
   '    if (p == null || depth > 7 || outp.Count >= 80) return;',
@@ -808,7 +912,9 @@ const UIA_CSHARP = [
   '  }',
   '}'
 ].join('\n');
-const UIA_PS_PROLOG = ["$src = @'", UIA_CSHARP, "'@", 'Add-Type -ReferencedAssemblies UIAutomationClient,UIAutomationTypes,WindowsBase -TypeDefinition $src'];
+/* GT_BODY ships inside UIA_CSHARP so the Click method can call GT.TypeText
+   directly when click_element is used with type_text. */
+const UIA_PS_PROLOG = asmProlog('uia', 'UIA', UIA_CSHARP, 'UIAutomationClient,UIAutomationTypes,WindowsBase');
 async function listElements() {
   if (process.platform === 'win32') {
     const out = await winPS(UIA_PS_PROLOG.concat(['[UIA]::List()']).join('\n'));
@@ -832,9 +938,9 @@ async function listElements() {
   }
   throw new Error('Listing window elements is not supported on this version of Linux yet. Take a screenshot and use mouse_click instead.');
 }
-async function clickElement(name, kind) {
+async function clickElement(name, kind, typeText) {
   if (process.platform === 'win32') {
-    const out = (await winPS(UIA_PS_PROLOG.concat(['[UIA]::Click($env:GLUCER_NAME, $env:GLUCER_KIND)']).join('\n'), { GLUCER_NAME: name, GLUCER_KIND: kind || '' })).trim();
+    const out = (await winPS(UIA_PS_PROLOG.concat(['[UIA]::Click($env:GLUCER_NAME, $env:GLUCER_KIND, $env:GLUCER_TYPE)']).join('\n'), { GLUCER_NAME: name, GLUCER_KIND: kind || '', GLUCER_TYPE: typeText || '' })).trim();
     if (out.startsWith('ERR')) throw new Error(out.replace(/^ERR:\s*/, ''));
     return out.replace(/^OK\s*/, '');
   }
@@ -842,21 +948,28 @@ async function clickElement(name, kind) {
     const lines = [
       'on run argv',
       'set q to (item 1 of argv)',
+      'set ttext to ""',
+      'if (count of argv) > 1 then set ttext to (item 2 of argv)',
       'tell application "System Events"',
       'set ps to first application process whose frontmost is true',
       'repeat with e in (every UI element of window 1 of ps)',
       'try',
       'if ((name of e) as string) contains q then',
       'click e',
+      'if ttext is not "" then',
+      'delay 0.2',
+      'keystroke ttext',
+      'return ("OK focused " & (name of e) & " and typed")',
+      'end if',
       'return ("OK clicked " & (name of e))',
       'end if',
       'end try',
       'end repeat',
-      'return "ERR: no element with that name in the front window. Call list_elements to see the names."',
+      'return "ERR: no element with that name in the front window. The front window has these: " & (name of every UI element of window 1 of ps whose name is not missing value)',
       'end tell',
       'end run'
     ];
-    const out = (await runCmd('osascript', lines.flatMap((l) => ['-e', l]).concat([name]))).trim();
+    const out = (await runCmd('osascript', lines.flatMap((l) => ['-e', l]).concat([typeText ? [name, typeText] : [name]]).flat())).trim();
     if (out.startsWith('ERR')) throw new Error(out.replace(/^ERR:\s*/, ''));
     return out.replace(/^OK\s*/, '');
   }
@@ -899,7 +1012,7 @@ const TOOLS = {
       const image = await takeScreenshot(p.disp);
       if (image.imgW) lastShot = image;
       const monTxt = image.monCount > 1 ? ' — monitor ' + (image.mon || 1) + ' of ' + image.monCount : '';
-      return ok({ note: 'The screenshot is attached to this message as an image, with a red coordinate grid and yellow number labels drawn on it — read the x,y for mouse tools straight off those labels. Mouse tool coordinates are pixels in THIS picture (' + image.imgW + 'x' + image.imgH + ')' + monTxt + ', and clicking works on every monitor. For small targets, zoom in with screenshot_region before clicking.', monitor: image.mon || 1, monitors: image.monCount || 1 }, 'Looked at your screen' + monTxt, { image });
+      return ok({ note: 'The screenshot is attached to this message as an image, with a red coordinate grid and yellow number labels drawn on it — read the x,y for mouse tools straight off those labels. Mouse tool coordinates are pixels in THIS picture (' + image.imgW + 'x' + image.imgH + ')' + monTxt + ', and clicking works on every monitor. If what you want to click shows a name on screen, use click_element — it is faster and more accurate than clicking pixels.', monitor: image.mon || 1, monitors: image.monCount || 1 }, 'Looked at your screen' + monTxt, { image });
     }
   },
 
@@ -965,11 +1078,16 @@ const TOOLS = {
       const name = String(a.name || '').trim();
       if (!name) throw new Error('Say what to click (its name, like "File" or "Save").');
       const kind = ['button', 'menuitem', 'tabitem', 'link', 'hyperlink', 'checkbox', 'radiobutton', 'listitem', 'combobox', 'menu', 'treeitem'].includes(String(a.kind || '').toLowerCase()) ? String(a.kind).toLowerCase() : '';
-      return { name, kind, lines: ['Click "' + name + '"' + (kind ? ' (' + kind + ')' : '') + ' in the active window, by name'] };
+      let typeText = null;
+      if (a.type_text != null && String(a.type_text) !== '') {
+        typeText = String(a.type_text);
+        if (typeText.length > 500) throw new Error('That text is too long to type. For long text, use clipboard_write, then key_press with ctrl+v.');
+      }
+      return { name, kind, typeText, lines: ['Click "' + name + '"' + (kind ? ' (' + kind + ')' : '') + (typeText ? ' and type into it' : '') + ' — by name, in whatever window has it'] };
     },
     run: async (a, p) => {
-      const detail = await clickElement(p.name, p.kind);
-      return ok({ clicked: p.name, detail }, 'Clicked "' + p.name + '" by name');
+      const detail = await clickElement(p.name, p.kind, p.typeText);
+      return ok({ clicked: p.name, detail }, p.typeText ? 'Clicked "' + p.name + '" and typed' : 'Clicked "' + p.name + '" by name');
     }
   },
 
@@ -1280,7 +1398,7 @@ const TOOLS = {
       const res = await mouseClick(pos, p.btn);
       const v = res && res.verify;
       return ok(
-        { x: pos.cx, y: pos.cy, button: p.btn, check: v ? 'A close-up is attached. The red cross marks EXACTLY where the click landed. If the cross is not on the thing you meant to click, take a fresh screenshot and click again with adjusted coordinates.' : 'No verification picture this time — take a screenshot to check the result.' },
+        { x: pos.cx, y: pos.cy, button: p.btn, check: v ? 'A close-up is attached. The red cross marks EXACTLY where the click landed. If the cross is not on the thing you meant to click, just click again with adjusted coordinates — the screen is re-checked automatically, so no new screenshot is needed.' : 'No verification picture this time — take a screenshot to check the result.' },
         'Clicked ' + p.btn + ' at (' + pos.cx + ', ' + pos.cy + ')' + (reAimed ? ' (screen was re-checked just before, so the aim is current)' : ''),
         v ? { image: v } : undefined
       );
