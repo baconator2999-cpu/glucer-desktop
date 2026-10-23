@@ -6,6 +6,11 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const { exec, execFile, execSync, spawn } = require('child_process');
+// In the desktop app, web links are opened by Electron's shell (the real
+// browser launcher) - never by explorer.exe, which can pop a File Explorer
+// window instead of the browser on some machines.
+let shellOpen = null;
+if (process.versions.electron) { try { shellOpen = (u) => require('electron').shell.openExternal(u); } catch (e) {} }
 
 const IS_ELECTRON = !!process.versions.electron;
 const AS_SERVER = require.main === module;
@@ -1353,6 +1358,18 @@ const TOOLS = {
       throw new Error('Could not find that file, folder or app.');
     },
     run: async (a, p) => {
+      // Web links must reach the real browser. In the desktop app that is
+      // Electron's shell.openExternal; standalone mode uses the OS launcher
+      // (rundll32 on Windows - NOT explorer.exe, which can open a File
+      // Explorer window instead of the browser).
+      if (p.kind === 'url') {
+        if (shellOpen) { await shellOpen(p.target); return ok({ opened: p.target, via: 'browser' }, 'Opened in your browser'); }
+        let cmd, args;
+        if (process.platform === 'win32') { cmd = 'rundll32'; args = ['url.dll,FileProtocolHandler', p.target]; }
+        else { cmd = process.platform === 'darwin' ? 'open' : 'xdg-open'; args = [p.target]; }
+        spawn(cmd, args, { detached: true, stdio: 'ignore' }).on('error', () => {}).unref();
+        return ok({ opened: p.target, via: 'browser' }, 'Opened in your browser');
+      }
       let cmd, args;
       if (process.platform === 'win32') {
         if (p.kind === 'app') { cmd = 'cmd.exe'; args = ['/c', 'start', '', p.target]; } else { cmd = 'explorer.exe'; args = [p.target]; }
