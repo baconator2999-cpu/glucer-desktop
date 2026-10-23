@@ -760,6 +760,7 @@ async function focusWindow(q) {
 const UIA_CSHARP = [
   'using System;',
   'using System.Collections.Generic;',
+  'using System.Reflection;',
   'using System.Runtime.InteropServices;',
   'using System.Text;',
   'using System.Threading;',
@@ -781,7 +782,10 @@ const UIA_CSHARP = [
   '    SetProcessDPIAware();',
   '    IntPtr h = GetForegroundWindow();',
   '    if (h != IntPtr.Zero) { try { return AutomationElement.FromHandle(h); } catch (Exception) {} }',
-  '    try { return AutomationElement.FocusedWindow; } catch (Exception) {}',
+  // FocusedElement is the REAL property name - "FocusedWindow" does not exist
+  // in System.Windows.Automation and its compile error used to kill the whole
+  // UIA class, silently disabling precise clicking for everyone.
+  '    try { return AutomationElement.FocusedElement; } catch (Exception) {}',
   '    return AutomationElement.RootElement;',
   '  }',
   '  public class Cand { public AutomationElement el; public string name; public string kind; public int score; }',
@@ -844,7 +848,8 @@ const UIA_CSHARP = [
   '    try { p = el.GetCurrentPattern(TogglePattern.Pattern); if (p is TogglePattern) { ((TogglePattern)p).Toggle(); return "toggled"; } } catch (Exception) {}',
   '    try { p = el.GetCurrentPattern(ExpandCollapsePattern.Pattern); if (p is ExpandCollapsePattern) { ((ExpandCollapsePattern)p).Expand(); return "expanded"; } } catch (Exception) {}',
   '    try { p = el.GetCurrentPattern(SelectionItemPattern.Pattern); if (p is SelectionItemPattern) { ((SelectionItemPattern)p).Select(); return "selected"; } } catch (Exception) {}',
-  '    try { p = el.GetCurrentPattern(LegacyIAccessiblePattern.Pattern); if (p is LegacyIAccessiblePattern) { ((LegacyIAccessiblePattern)p).DoDefaultAction(); return "pressed"; } } catch (Exception) {}',
+  '    // LegacyIAccessiblePattern is referenced by REFLECTION, never by name: naming it breaks the Add-Type compile on some machines, and one compile error used to disable ALL clicking.',
+  '    try { foreach (AutomationPattern apat in el.GetSupportedPatterns()) { if (apat.ProgrammaticName.IndexOf("LegacyIAccessible", StringComparison.OrdinalIgnoreCase) >= 0) { object lp = el.GetCurrentPattern(apat); MethodInfo mi = lp.GetType().GetMethod("DoDefaultAction"); if (mi != null) { mi.Invoke(lp, null); return "pressed"; } } } } catch (Exception) {}',
   '    double x = 0, y = 0; bool got = false;',
   '    try { var pt = el.GetClickablePoint(); x = pt.X; y = pt.Y; got = true; } catch (Exception) {}',
   '    if (!got) { try { var r = el.Current.BoundingRectangle; x = r.X + r.Width / 2; y = r.Y + r.Height / 2; got = r.Width > 0 && r.Height > 0; } catch (Exception) {} }',
@@ -861,7 +866,7 @@ const UIA_CSHARP = [
   '    var found = new List<Cand>();',
   '    AutomationElement fg = null;',
   '    try { IntPtr h = GetForegroundWindow(); if (h != IntPtr.Zero) fg = AutomationElement.FromHandle(h); } catch (Exception) {}',
-  '    if (fg == null) { try { fg = AutomationElement.FocusedWindow; } catch (Exception) {} }',
+  '    if (fg == null) { try { fg = AutomationElement.FocusedElement; } catch (Exception) {} }',
   '    if (fg != null) Search(fg, ql, kind, found);',
   '    if (found.Count == 0) {',
   '      try {',
