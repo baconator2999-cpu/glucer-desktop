@@ -225,7 +225,7 @@ function asmProlog(key, className, cs, refs) {
 }
 const GD_CSHARP = 'using System.Runtime.InteropServices; public class GD { [DllImport("user32.dll")] public static extern bool SetProcessDPIAware(); }';
 
-async function winCaptureMonitor(displayArg, noGrid) {
+async function winCaptureMonitor(displayArg) {
   const tmp = path.join(os.tmpdir(), 'glucer-shot-' + newId() + '.jpg');
   try {
     const script = [
@@ -245,12 +245,12 @@ async function winCaptureMonitor(displayArg, noGrid) {
       // Coordinate grid: thin red lines every 200 px of THIS picture, with
       // yellow number labels every 400 px, so the AI can READ coordinates off
       // the image instead of guessing them — the #1 cure for mis-clicks.
-      '$gp = New-Object System.Drawing.Pen -ArgumentList ([System.Drawing.Color]::FromArgb(' + (noGrid ? 0 : 120) + ', 255, 60, 60))',
+      '$gp = New-Object System.Drawing.Pen -ArgumentList ([System.Drawing.Color]::FromArgb(120, 255, 60, 60))',
       'for ($gx = 200; $gx -lt $iw; $gx += 200) { $g2.DrawLine($gp, $gx, 0, $gx, $ih) }',
       'for ($gy = 200; $gy -lt $ih; $gy += 200) { $g2.DrawLine($gp, 0, $gy, $iw, $gy) }',
       '$gf = New-Object System.Drawing.Font -ArgumentList "Arial", 14, ([System.Drawing.FontStyle]::Bold)',
-      '$gbs = New-Object System.Drawing.SolidBrush -ArgumentList ([System.Drawing.Color]::FromArgb(' + (noGrid ? 0 : 160) + ', 0, 0, 0))',
-      '$gfs = New-Object System.Drawing.SolidBrush -ArgumentList ([System.Drawing.Color]::FromArgb(' + (noGrid ? 0 : 235) + ', 255, 220, 60))',
+      '$gbs = New-Object System.Drawing.SolidBrush -ArgumentList ([System.Drawing.Color]::FromArgb(160, 0, 0, 0))',
+      '$gfs = New-Object System.Drawing.SolidBrush -ArgumentList ([System.Drawing.Color]::FromArgb(235, 255, 220, 60))',
       'for ($gx = 400; $gx -lt $iw; $gx += 400) { $gtxt = [string]$gx; $gsz = $g2.MeasureString($gtxt, $gf); $g2.FillRectangle($gbs, $gx + 3, 3, $gsz.Width, $gsz.Height); $g2.DrawString($gtxt, $gf, $gfs, $gx + 3, 3) }',
       'for ($gy = 400; $gy -lt $ih; $gy += 400) { $gtxt = [string]$gy; $gsz = $g2.MeasureString($gtxt, $gf); $g2.FillRectangle($gbs, 3, $gy + 3, $gsz.Width, $gsz.Height); $g2.DrawString($gtxt, $gf, $gfs, 3, $gy + 3) }',
       '$out.Save($env:GLUCER_OUT, [System.Drawing.Imaging.ImageFormat]::Jpeg)',
@@ -303,7 +303,7 @@ async function winCaptureRect(L, T, W, H, srcShot) {
     return { mime: 'image/jpeg', data: buf.toString('base64'), imgW: n[0], imgH: n[1], screenW: n[0], screenH: n[1], originX: Math.round(L), originY: Math.round(T), scale: 1, mon: (srcShot && srcShot.mon) || 1, monCount: (srcShot && srcShot.monCount) || 1, region: true, at: Date.now() };
   } finally { try { fs.unlinkSync(tmp); } catch (e) {} }
 }
-async function takeScreenshot(displayArg, noGrid) {
+async function takeScreenshot(displayArg) {
   if (IS_ELECTRON) {
     const { desktopCapturer, screen } = require('electron');
     const displays = screen.getAllDisplays();
@@ -311,7 +311,7 @@ async function takeScreenshot(displayArg, noGrid) {
     // has the red coordinate grid, true physical coordinates and the monitor
     // origin — that is what lets the mouse reach every display accurately.
     if (process.platform === 'win32') {
-      try { return await winCaptureMonitor(displayArg, noGrid); } catch (e) {}
+      try { return await winCaptureMonitor(displayArg); } catch (e) {}
     }
     const d = screen.getPrimaryDisplay();
     const physW = Math.round(d.size.width * d.scaleFactor), physH = Math.round(d.size.height * d.scaleFactor);
@@ -328,7 +328,7 @@ async function takeScreenshot(displayArg, noGrid) {
     const size = src.thumbnail.getSize();
     return { mime: 'image/jpeg', data: src.thumbnail.toJPEG(75).toString('base64'), imgW: size.width, imgH: size.height, screenW: physW, screenH: physH, originX: 0, originY: 0, mon: displays.findIndex((x) => x.id === d.id) + 1 || 1, monCount: displays.length, scale: d.scaleFactor, at: Date.now() };
   }
-  if (process.platform === 'win32') { try { return await winCaptureMonitor(displayArg, noGrid); } catch (e) {} }
+  if (process.platform === 'win32') { try { return await winCaptureMonitor(displayArg); } catch (e) {} }
   const jpg = process.platform === 'win32' || process.platform === 'darwin';
   let shotDims = null; // [screenW, screenH, imgW, imgH]
   const tmp = path.join(os.tmpdir(), 'glucer-shot-' + newId() + (jpg ? '.jpg' : '.png'));
@@ -447,99 +447,51 @@ const GM_CSHARP = [
   '  [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, int d, UIntPtr e);',
   '}'
 ].join('\n');
-/* Close-up used after a click AND before a click (aim preview). It is cropped at
-   native resolution, enlarged 2x so small text is readable, and its yellow grid
-   numbers are in the SAME coordinates as the full screenshot - so whatever the AI
-   reads off the close-up can be fed straight back into mouse_click. (Before, the
-   close-up had no numbers at all, so a "correction" got read in close-up pixels and
-   was then applied to the full picture: the click jumped to the wrong place.) */
-const CLOSE_W = 480, CLOSE_H = 300, CLOSE_ZOOM = 2, CLOSE_STEP = 50;
-function aimLines(x, y, move) {
-  const origin = lastShot && (lastShot.region || Number(lastShot.originX) || Number(lastShot.originY));
-  const out = [];
-  if (origin) {
-    out.push('$sx = 1.0; $sy = 1.0', '$px = ' + Math.round(x) + '; $py = ' + Math.round(y));
-  } else {
-    // Self-calibration: the process that clicks measures the real screen size
-    // itself and rescales, so a wrong scale report from Electron can never steer
-    // the cursor to the wrong place.
-    const eW = Math.max(1, (lastShot && lastShot.screenW) || 0);
-    const eH = Math.max(1, (lastShot && lastShot.screenH) || 0);
-    out.push('$sx = [double][GM]::GetSystemMetrics(0) / ' + eW, '$sy = [double][GM]::GetSystemMetrics(1) / ' + eH,
-      '$px = [int][Math]::Round(' + x + ' * $sx); $py = [int][Math]::Round(' + y + ' * $sy)');
-  }
-  if (move) out.push('[void][GM]::SetCursorPos($px, $py)');
-  return out;
-}
-function closeupLines() {
-  const o = lastShot || {};
-  const hasMon = o.region || ((Number(o.originX) || Number(o.originY)) && Number(o.screenW) > 0 && Number(o.screenH) > 0);
-  const orgX = hasMon ? Math.round(Number(o.originX) || 0) : 0, orgY = hasMon ? Math.round(Number(o.originY) || 0) : 0;
-  const imgW = Math.max(1, Number(o.imgW) || 1), imgH = Math.max(1, Number(o.imgH) || 1);
-  const scrW = Math.max(1, Number(o.screenW) || 1), scrH = Math.max(1, Number(o.screenH) || 1);
-  // PS variable names are case-INSENSITIVE - every name below is distinct on purpose.
-  return [
-    'Add-Type -AssemblyName System.Drawing',
-    '$mnL = ' + orgX + '; $mnT = ' + orgY,
-    hasMon ? '$mnW = ' + Math.round(scrW) + '; $mnH = ' + Math.round(scrH) : '$mnW = [GM]::GetSystemMetrics(0); $mnH = [GM]::GetSystemMetrics(1)',
-    '$cw = [Math]::Min(' + CLOSE_W + ', $mnW); $ch = [Math]::Min(' + CLOSE_H + ', $mnH)',
-    '$bx = [Math]::Max($mnL, [Math]::Min($mnL + $mnW - $cw, $px - [int]($cw / 2)))',
-    '$by = [Math]::Max($mnT, [Math]::Min($mnT + $mnH - $ch, $py - [int]($ch / 2)))',
-    '$zm = ' + CLOSE_ZOOM + '; $vw = $cw * $zm; $vh = $ch * $zm',
-    '$src = New-Object System.Drawing.Bitmap $cw, $ch',
-    '$sg = [System.Drawing.Graphics]::FromImage($src)',
-    '$sg.CopyFromScreen($bx, $by, 0, 0, (New-Object System.Drawing.Size($cw, $ch)))',
-    '$v = New-Object System.Drawing.Bitmap $vw, $vh',
-    '$vg = [System.Drawing.Graphics]::FromImage($v)',
-    "$vg.InterpolationMode = 'HighQualityBicubic'",
-    '$vg.DrawImage($src, 0, 0, $vw, $vh)',
-    // Grid lines every CLOSE_STEP px of the FULL screenshot, labelled in that picture's coordinates.
-    '$kfx = ' + imgW + ' / ' + scrW + '; $kfy = ' + imgH + ' / ' + scrH + '; $orgX = ' + orgX + '; $orgY = ' + orgY,
-    '$gpn = New-Object System.Drawing.Pen -ArgumentList ([System.Drawing.Color]::FromArgb(110, 255, 60, 60))',
-    '$gfn = New-Object System.Drawing.Font -ArgumentList "Arial", 10, ([System.Drawing.FontStyle]::Bold)',
-    '$gbr = New-Object System.Drawing.SolidBrush -ArgumentList ([System.Drawing.Color]::FromArgb(170, 0, 0, 0))',
-    '$gyl = New-Object System.Drawing.SolidBrush -ArgumentList ([System.Drawing.Color]::FromArgb(240, 255, 220, 60))',
-    '$ia = (($bx / $sx) - $orgX) * $kfx; $ib = ((($bx + $cw) / $sx) - $orgX) * $kfx',
-    '$ja = (($by / $sy) - $orgY) * $kfy; $jb = ((($by + $ch) / $sy) - $orgY) * $kfy',
-    'for ($gi = [Math]::Ceiling($ia / ' + CLOSE_STEP + ') * ' + CLOSE_STEP + '; $gi -lt $ib; $gi += ' + CLOSE_STEP + ') { $gxp = [int]((($orgX + $gi / $kfx) * $sx - $bx) * $zm); $vg.DrawLine($gpn, $gxp, 0, $gxp, $vh); $gtx = [string][int]$gi; $gz = $vg.MeasureString($gtx, $gfn); $vg.FillRectangle($gbr, $gxp + 2, 2, $gz.Width, $gz.Height); $vg.DrawString($gtx, $gfn, $gyl, $gxp + 2, 2) }',
-    'for ($gj = [Math]::Ceiling($ja / ' + CLOSE_STEP + ') * ' + CLOSE_STEP + '; $gj -lt $jb; $gj += ' + CLOSE_STEP + ') { $gyp = [int]((($orgY + $gj / $kfy) * $sy - $by) * $zm); $vg.DrawLine($gpn, 0, $gyp, $vw, $gyp); $gtx = [string][int]$gj; $gz = $vg.MeasureString($gtx, $gfn); $vg.FillRectangle($gbr, 2, $gyp + 2, $gz.Width, $gz.Height); $vg.DrawString($gtx, $gfn, $gyl, 2, $gyp + 2) }',
-    // Red cross + ring on the exact aim point.
-    '$lx = [int](($px - $bx) * $zm); $ly = [int](($py - $by) * $zm)',
-    '$vg.DrawLine([System.Drawing.Pens]::Red, $lx - 24, $ly, $lx + 24, $ly)',
-    '$vg.DrawLine([System.Drawing.Pens]::Red, $lx, $ly - 24, $lx, $ly + 24)',
-    '$vg.DrawEllipse([System.Drawing.Pens]::Red, $lx - 8, $ly - 8, 16, 16)',
-    '$vg.FillRectangle([System.Drawing.Brushes]::Red, $lx - 2, $ly - 2, 5, 5)',
-    '$v.Save($env:GLUCER_SHOT, [System.Drawing.Imaging.ImageFormat]::Jpeg)'
-  ];
-}
 function mouseScript(x, y, actions, shotPath) {
-  const head = asmProlog('gm', 'GM', GM_CSHARP).concat(['[void][GM]::SetProcessDPIAware()']);
-  const tail = ['Start-Sleep -Milliseconds 80'].concat(shotPath ? closeupLines() : []);
-  return head.concat(aimLines(x, y, true), ['Start-Sleep -Milliseconds 120', actions], tail).join('\n');
-}
-/* AIM PREVIEW: look at the exact spot BEFORE clicking. The AI guesses pixels from a
-   shrunken screenshot (a 30 px button on a 1600 px picture is easy to miss by 20 px),
-   so the first mouse_click only shows a sharp close-up with a red cross and clicks
-   nothing. The AI then re-sends the same x,y to fire, or sends corrected numbers read
-   off the close-up's yellow grid. Set AIM_PREVIEW = false to go back to one-step clicks. */
-const AIM_PREVIEW = true;
-const AIM_CONFIRM_PX = 3;     // same spot (within this many screenshot px) = "yes, fire"
-const AIM_MAX_PREVIEWS = 3;   // after this many previews in a row, fire anyway (no endless loops)
-let pendingAim = null;        // { x, y, at, n } in screenshot coordinates
-function aimState(ax, ay) {
-  if (pendingAim && Date.now() - pendingAim.at > 120000) pendingAim = null;
-  const confirmed = !!(pendingAim && Math.hypot(pendingAim.x - Number(ax), pendingAim.y - Number(ay)) <= AIM_CONFIRM_PX);
-  const exhausted = !!(pendingAim && pendingAim.n >= AIM_MAX_PREVIEWS);
-  return { needPreview: AIM_PREVIEW && process.platform === 'win32' && !confirmed && !exhausted };
-}
-async function aimPreview(pos) {
-  const tmp = path.join(os.tmpdir(), 'glucer-aim-' + newId() + '.jpg');
-  try {
-    const script = asmProlog('gm', 'GM', GM_CSHARP).concat(['[void][GM]::SetProcessDPIAware()'], aimLines(pos.cx, pos.cy, false), closeupLines()).join('\n');
-    await winPS(script, { GLUCER_SHOT: tmp });
-    const b = fs.readFileSync(tmp);
-    return b.length ? { mime: 'image/jpeg', data: b.toString('base64') } : null;
-  } finally { try { fs.unlinkSync(tmp); } catch (e) {} }
+  // Optional tail: after the click, photograph a small close-up around the
+  // click point (clamped inside the monitor the click belongs to) with a red
+  // cross on the exact spot, so the AI can SEE where it landed and correct
+  // itself if it missed.
+  let tail = ['Start-Sleep -Milliseconds 80'];
+  if (shotPath) {
+    const o = lastShot || {};
+    const hasMon = o.region || (Number(o.originX) || Number(o.originY)) && Number(o.screenW) > 0 && Number(o.screenH) > 0;
+    const crop = [
+      'Add-Type -AssemblyName System.Drawing',
+      '$ML = ' + (hasMon ? Math.round(Number(o.originX)) : 0) + '; $MT = ' + (hasMon ? Math.round(Number(o.originY)) : 0),
+      hasMon ? '$MW = ' + Math.round(Number(o.screenW)) + '; $MH = ' + Math.round(Number(o.screenH)) : '$MW = [GM]::GetSystemMetrics(0); $MH = [GM]::GetSystemMetrics(1)',
+      '$cw = [Math]::Min(400, $MW); $ch = [Math]::Min(250, $MH)',
+      '$bx = [Math]::Max($ML, [Math]::Min($ML + $MW - $cw, ' + Math.round(x) + ' - [int]($cw/2)))',
+      '$by = [Math]::Max($MT, [Math]::Min($MT + $MH - $ch, ' + Math.round(y) + ' - [int]($ch/2)))',
+      '$v = New-Object System.Drawing.Bitmap $cw, $ch',
+      '$vg = [System.Drawing.Graphics]::FromImage($v)',
+      '$vg.CopyFromScreen($bx, $by, 0, 0, (New-Object System.Drawing.Size($cw, $ch)))',
+      '$lx = ' + Math.round(x) + ' - $bx; $ly = ' + Math.round(y) + ' - $by',
+      '$vg.DrawLine([System.Drawing.Pens]::Red, $lx - 20, $ly, $lx + 20, $ly)',
+      '$vg.DrawLine([System.Drawing.Pens]::Red, $lx, $ly - 20, $lx, $ly + 20)',
+      '$vg.FillRectangle([System.Drawing.Brushes]::Red, $lx - 2, $ly - 2, 5, 5)',
+      '$v.Save($env:GLUCER_SHOT, [System.Drawing.Imaging.ImageFormat]::Jpeg)'
+    ];
+    tail = tail.concat(crop);
+  }
+  // Multi-monitor and zoomed pictures both carry their true desktop position
+  // (lastShot.region marks a zoom), so the click process (which is DPI-aware)
+  // moves the cursor straight there — a zoomed crop at desktop position 0,0
+  // must ALSO take this branch or its coordinates would be rescaled 5-8x.
+  if (lastShot && (lastShot.region || Number(lastShot.originX) || Number(lastShot.originY))) {
+    return asmProlog('gm', 'GM', GM_CSHARP).concat(['[void][GM]::SetProcessDPIAware()',
+      '[void][GM]::SetCursorPos(' + Math.round(x) + ', ' + Math.round(y) + ')',
+      'Start-Sleep -Milliseconds 120', actions], tail).join('\n');
+  }
+  // Self-calibration: the process that clicks measures the real screen size
+  // itself and rescales, so a wrong scale report from Electron (display
+  // scaling, mixed DPI) can never steer the cursor to the wrong place.
+  const eW = Math.max(1, (lastShot && lastShot.screenW) || 0);
+  const eH = Math.max(1, (lastShot && lastShot.screenH) || 0);
+  return asmProlog('gm', 'GM', GM_CSHARP).concat(['[void][GM]::SetProcessDPIAware()',
+    '$sx = [double][GM]::GetSystemMetrics(0) / ' + eW + '; $sy = [double][GM]::GetSystemMetrics(1) / ' + eH,
+    '[void][GM]::SetCursorPos([int][Math]::Round(' + x + ' * $sx), [int][Math]::Round(' + y + ' * $sy))',
+    'Start-Sleep -Milliseconds 120', actions], tail).join('\n');
 }
 const GT_BODY = [
   'public class GT {',
@@ -562,7 +514,7 @@ const GT_BODY = [
   '}'
 ].join('\n');
 const GT_CSHARP = ['using System;', 'using System.Runtime.InteropServices;', 'using System.Threading;'].concat(GT_BODY).join('\n');
-async function mouseClick(pos, btn, noVerify) {
+async function mouseClick(pos, btn) {
   if (process.platform === 'win32') {
     const acts = btn === 'right'
       ? '[GM]::mouse_event(8,0,0,0,[UIntPtr]::Zero); Start-Sleep -Milliseconds 50; [GM]::mouse_event(16,0,0,0,[UIntPtr]::Zero)'
@@ -571,7 +523,7 @@ async function mouseClick(pos, btn, noVerify) {
       : '[GM]::mouse_event(2,0,0,0,[UIntPtr]::Zero); Start-Sleep -Milliseconds 50; [GM]::mouse_event(4,0,0,0,[UIntPtr]::Zero)';
     const tmp = path.join(os.tmpdir(), 'glucer-click-' + newId() + '.jpg');
     try {
-      await winPS(mouseScript(pos.cx, pos.cy, acts, noVerify ? null : tmp), { GLUCER_SHOT: tmp });
+      await winPS(mouseScript(pos.cx, pos.cy, acts, tmp), { GLUCER_SHOT: tmp });
       let verify = null;
       try { const b = fs.readFileSync(tmp); if (b.length) verify = { mime: 'image/jpeg', data: b.toString('base64') }; } catch (e) {}
       return { verify };
@@ -1159,10 +1111,11 @@ async function clickElement(name, kind, typeText) {
 const SKIP = new Set(['node_modules', '.git', 'AppData', 'Library', '$Recycle.Bin', 'System Volume Information', 'Windows', 'Program Files', 'Program Files (x86)', '.cache', '.npm']);
 const BINARY_EXT = /^(png|jpe?g|gif|webp|ico|bmp|pdf|zip|rar|7z|gz|tar|exe|dll|msi|iso|dmg|mp3|mp4|mov|avi|mkv|wav|flac|ttf|otf|woff2?|bin|dat|db|sqlite|class|jar|so|dylib|docx|xlsx|pptx)$/i;
 const RISKY_OPEN = /\.(exe|bat|cmd|ps1|sh|msi|app|command|scr|vbs|jar|lnk)$/i;
-const BLOCKED = [
-  /\brm\s+-[a-z]*r[a-z]*\s+(\/|~|\$HOME|\*)(\s|$)/i, /\bmkfs/i, /\bdd\s+.*of=\/dev\//i, /\bformat\s+[a-z]:/i,
-  /\b(rd|rmdir)\s+\/s.*\b[a-z]:\\?(\s|$)/i, /\bdel\s+.*\b[a-z]:\\\*?(\s|$)/i, /\bdiskpart\b/i, /\bshutdown\b/i, /:\(\)\s*\{/
-];
+// v2.7 FULL CONTROL: there is no command blocklist any more. Powerful commands
+// (shutdown, restart, disk tools, permanent deletes, system areas) run when the
+// user asks for them - the approval card still shows the exact command for a
+// final yes-or-no, and "Always allowed" skips that only if the owner chose it.
+// Only Read-only mode keeps commands off, as always.
 // Tools that only look. Read-only mode allows only these.
 const READ_OK_TOOLS = new Set(['system_info', 'list_folder', 'find_files', 'search_in_files', 'read_text_file', 'read_document', 'reveal_item', 'screenshot', 'screenshot_region', 'clipboard_read', 'list_windows', 'list_elements', '__activity']);
 
@@ -1184,14 +1137,14 @@ const TOOLS = {
     plan: (a) => {
       const d = Math.max(0, Math.min(10, Number(a.delay_seconds) || 0));
       const disp = a.display == null || a.display === '' ? null : (Number(a.display) >= 1 ? Math.round(Number(a.display)) : null);
-      return { d, disp, clean: !!a.clean, risk: 'high', lines: ['Take a screenshot' + (disp ? ' of monitor ' + disp : ' of the monitor with the active window') + (d ? ' in ' + d + ' seconds (switch to the window you want Glucer to see)' : ''), 'The picture is sent to the AI service to answer you. Close anything private first.'] };
+      return { d, disp, risk: 'high', lines: ['Take a screenshot' + (disp ? ' of monitor ' + disp : ' of the monitor with the active window') + (d ? ' in ' + d + ' seconds (switch to the window you want Glucer to see)' : ''), 'The picture is sent to the AI service to answer you. Close anything private first.'] };
     },
     run: async (a, p) => {
       if (p.d) await sleep(p.d * 1000);
-      const image = await takeScreenshot(p.disp, p.clean);
-      if (image.imgW) { lastShot = image; pendingAim = null; }
+      const image = await takeScreenshot(p.disp);
+      if (image.imgW) lastShot = image;
       const monTxt = image.monCount > 1 ? ' — monitor ' + (image.mon || 1) + ' of ' + image.monCount : '';
-      return ok({ note: 'The screenshot is attached to this message as an image, with a red coordinate grid and yellow number labels drawn on it — read the x,y for mouse tools straight off those labels. Mouse tool coordinates are plain pixels (NOT a 0-1000 scale, NOT percentages) in THIS picture (' + image.imgW + 'x' + image.imgH + ')' + monTxt + ', and clicking works on every monitor. If what you want to click shows words on screen (a button label, or placeholder text inside a box like "Send a message" or "Type here"), use click_element with those exact words — it is far more accurate than clicking pixels.', monitor: image.mon || 1, monitors: image.monCount || 1 }, 'Looked at your screen' + monTxt, { image });
+      return ok({ note: 'The screenshot is attached to this message as an image, with a red coordinate grid and yellow number labels drawn on it — read the x,y for mouse tools straight off those labels. Mouse tool coordinates are pixels in THIS picture (' + image.imgW + 'x' + image.imgH + ')' + monTxt + ', and clicking works on every monitor. If what you want to click shows words on screen (a button label, or placeholder text inside a box like "Send a message" or "Type here"), use click_element with those exact words — it is far more accurate than clicking pixels.', monitor: image.mon || 1, monitors: image.monCount || 1 }, 'Looked at your screen' + monTxt, { image });
     }
   },
 
@@ -1217,7 +1170,7 @@ const TOOLS = {
       const L = Math.max(mL, Math.min(mL + mW - pw, pcx - Math.round(pw / 2)));
       const T = Math.max(mT, Math.min(mT + mH - ph, pcy - Math.round(ph / 2)));
       const img = await winCaptureRect(L, T, pw, ph, src);
-      lastShot = img; pendingAim = null;
+      lastShot = img;
       return ok({ note: 'A sharp close-up is attached with its own coordinate grid. Its yellow labels count from the close-up\'s OWN top-left corner, and mouse tool coordinates are pixels in THIS picture — click using these labels for pinpoint accuracy.', zoomed: true }, 'Zoomed in around (' + Math.round(p.x) + ', ' + Math.round(p.y) + ')', { image: img });
     }
   },
@@ -1562,7 +1515,6 @@ const TOOLS = {
       const cmd = String(a.command || '').trim();
       if (!cmd) throw new Error('No command given.');
       if (cmd.length > 2000) throw new Error('That command is too long.');
-      if (BLOCKED.some((re) => re.test(cmd))) throw new Error('That command is blocked for safety.');
       const cwd = resolveP(a.folder || '.');
       if (!fs.existsSync(cwd)) throw new Error('That folder does not exist.');
       return { cmd, cwd, lines: ['RUN THIS COMMAND: ' + cmd, 'In the folder: ' + short(cwd)], risk: 'high' };
@@ -1582,66 +1534,18 @@ const TOOLS = {
     plan: (a) => {
       const btn = ['left', 'right', 'double'].includes(a.button) ? a.button : 'left';
       const p = (lastShot && lastShot.imgW) ? toScreen(a.x, a.y) : null;
-      const preview = !!p && aimState(a.x, a.y).needPreview;
-      return { btn, ax: a.x, ay: a.y, p, lines: [preview
-        ? 'Aim the mouse at screen position (' + p.cx + ', ' + p.cy + ') and show a close-up first (nothing is clicked yet)'
-        : (btn === 'double' ? 'DOUBLE-click' : 'Click the ' + btn.toUpperCase() + ' mouse button') + (p ? ' at screen position (' + p.cx + ', ' + p.cy + ')' : ' on the screen')] };
+      return { btn, ax: a.x, ay: a.y, p, lines: [(btn === 'double' ? 'DOUBLE-click' : 'Click the ' + btn.toUpperCase() + ' mouse button') + (p ? ' at screen position (' + p.cx + ', ' + p.cy + ')' : ' on the screen')] };
     },
     run: async (a, p) => {
       const reAimed = await ensureShot();
       const pos = toScreen(p.ax, p.ay);
-      if (aimState(p.ax, p.ay).needPreview) {
-        let img = null;
-        try { img = await aimPreview(pos); } catch (e) {}
-        if (img) {
-          pendingAim = { x: Number(p.ax), y: Number(p.ay), at: Date.now(), n: (pendingAim ? pendingAim.n : 0) + 1 };
-          return ok(
-            { clicked: false, aimed_at: { x: Number(p.ax), y: Number(p.ay) }, note: 'NOTHING WAS CLICKED YET. The attached close-up is sharp, enlarged 2x, and the red cross is exactly where the click would land. Its yellow grid numbers are in the SAME coordinates as your screenshot. If the cross is on the thing you want, call mouse_click again with the SAME x and y to fire. If it is off, call mouse_click with corrected x,y read off the yellow grid numbers.' },
-            'Aimed at (' + pos.cx + ', ' + pos.cy + ') - close-up shown, nothing clicked yet',
-            { image: img }
-          );
-        }
-      }
-      pendingAim = null;
       const res = await mouseClick(pos, p.btn);
       const v = res && res.verify;
       return ok(
-        { x: pos.cx, y: pos.cy, button: p.btn, check: v ? 'A close-up is attached. The red cross marks EXACTLY where the click landed, and its yellow grid numbers are in the same coordinates as your screenshot. If the cross is not on the thing you meant to click, call mouse_click again with corrected x,y read off those numbers - the screen is re-checked automatically.' : 'No verification picture this time - take a screenshot to check the result.' },
+        { x: pos.cx, y: pos.cy, button: p.btn, check: v ? 'A close-up is attached. The red cross marks EXACTLY where the click landed. If the cross is not on the thing you meant to click, just click again with adjusted coordinates — the screen is re-checked automatically, so no new screenshot is needed.' : 'No verification picture this time — take a screenshot to check the result.' },
         'Clicked ' + p.btn + ' at (' + pos.cx + ', ' + pos.cy + ')' + (reAimed ? ' (screen was re-checked just before, so the aim is current)' : ''),
         v ? { image: v } : undefined
       );
-    }
-  },
-
-  /* Computer Use: runs ONE action chosen by Gemini's computer-use model. Its x,y are on a
-     0-999 grid over the clean screenshot, so they convert with a single multiply. The
-     aim-preview is skipped on purpose - this model is trained to aim. */
-  cu_act: {
-    plan: (a) => {
-      if (!a || !a.name) throw new Error('No action given.');
-      return { n: String(a.name), g: a.args || {}, lines: ['Computer Use: ' + a.name + (a.args && a.args.intent ? ' - ' + String(a.args.intent).slice(0, 120) : '')] };
-    },
-    run: async (a, p) => {
-      const g = p.g, n = p.n;
-      if (!lastShot || !lastShot.imgW) lastShot = await takeScreenshot(undefined, true);
-      const pos = (x, y) => toScreen(Number(x) / 1000 * lastShot.imgW, Number(y) / 1000 * lastShot.imgH);
-      if (n === 'click') await mouseClick(pos(g.x, g.y), 'left', true);
-      else if (n === 'double_click' || n === 'triple_click') await mouseClick(pos(g.x, g.y), 'double', true);
-      else if (n === 'right_click') await mouseClick(pos(g.x, g.y), 'right', true);
-      else if (n === 'move') { const q = pos(g.x, g.y); await winPS(mouseScript(q.cx, q.cy, 'Start-Sleep -Milliseconds 10')); }
-      else if (n === 'type') { await keyboardType(String(g.text || '')); if (g.press_enter) await keyPress(parseCombo('enter')); }
-      else if (n === 'press_key') await keyPress(parseCombo(g.key));
-      else if (n === 'hotkey') await keyPress(parseCombo((g.keys || []).join('+')));
-      else if (n === 'scroll') {
-        if (g.direction !== 'up' && g.direction !== 'down') throw new Error('Only up/down scrolling is supported.');
-        await mouseScroll(pos(g.x, g.y), g.direction, Math.max(1, Math.min(10, Math.round((Number(g.magnitude_in_pixels) || 300) / 100))));
-      }
-      else if (n === 'wait') await sleep(Math.min(10, Number(g.seconds) || 1) * 1000);
-      else if (n !== 'take_screenshot') throw new Error('Action not supported yet: ' + n);
-      await sleep(600);
-      const img = await takeScreenshot(lastShot.monCount > 1 ? lastShot.mon : undefined, true);
-      lastShot = img; pendingAim = null;
-      return ok({ done: n }, 'Did ' + n, { image: img });
     }
   },
 
