@@ -748,15 +748,24 @@ async function focusWindow(q) {
   }
 }
 
-/* ---------- Click by NAME v2 (UI Automation — exact, fast, self-correcting) ---------- */
+/* ---------- Click by NAME v3 (UI Automation — exact, fast, self-correcting) ---------- */
 /* Asks the app itself where its control is instead of aiming pixels at a
-   screenshot. v2 upgrades: fuzzy name matching (exact > prefix > contains,
-   also AutomationId), searches EVERY open window (no focus_window needed),
-   presses the control with its own automation pattern (Invoke/Toggle/Expand/
-   Select work even off-screen), scrolls it into view first, and — when the
-   name is not found — returns the REAL control names around it so the very
-   next call succeeds without any screenshot. type_text focuses the control
-   and types into it in the same call (click + type in one step). */
+   screenshot. v3 upgrades over v2: matching now understands THE WORDS THE USER
+   SEES. Query and every control are normalized (case/punctuation/spacing
+   ignored) and scored exact > prefix > contains > all-words > some-words, so
+   "Send a message" hits a box whose accessible name differs slightly, and
+   placeholder text like "Type here" or "Search" matches even when the Name
+   property is empty (HelpText and the field's current Value are scored too,
+   plus AutomationId). kind words are aliases now (link->hyperlink,
+   text box/input/search box->edit, dropdown->combobox, tab->tabitem, ...) and
+   if a kind filter would reject every match, the kind is dropped instead of
+   failing the call. Still searches EVERY open window (no focus_window
+   needed), presses the control with its own automation pattern
+   (Invoke/Toggle/Expand/Select work even off-screen), scrolls it into view
+   first, and — when the name is not found — returns the REAL control names
+   around it so the very next call succeeds without any screenshot.
+   type_text focuses the control and types into it in the same call
+   (click + type in one step). */
 const UIA_CSHARP = [
   'using System;',
   'using System.Collections.Generic;',
@@ -788,32 +797,82 @@ const UIA_CSHARP = [
   '    try { return AutomationElement.FocusedElement; } catch (Exception) {}',
   '    return AutomationElement.RootElement;',
   '  }',
-  '  public class Cand { public AutomationElement el; public string name; public string kind; public int score; }',
-  '  static void Search(AutomationElement win, string ql, string kind, List<Cand> found) {',
+  '  public class Cand { public AutomationElement el; public string name; public string kind; public int score; public bool kok; }',
+  '  static string Norm(string s) {',
+  '    if (s == null) return "";',
+  '    var sb = new StringBuilder();',
+  '    foreach (char ch in s.ToLower()) { if (char.IsLetterOrDigit(ch)) sb.Append(ch); else sb.Append(\' \'); }',
+  '    var parts = sb.ToString().Split(new char[] { \' \' }, StringSplitOptions.RemoveEmptyEntries);',
+  '    return string.Join(" ", parts);',
+  '  }',
+  '  static string[] MeaningfulWords(string s) {',
+  '    var stop = new string[] { "the", "an", "to", "of", "in", "on", "at", "for", "and", "or", "please", "my", "me", "this", "that", "it", "is", "be" };',
+  '    var w = Norm(s).Split(new char[] { \' \' }, StringSplitOptions.RemoveEmptyEntries);',
+  '    var keep = new List<string>();',
+  '    foreach (var x in w) { if (x.Length > 1 && Array.IndexOf(stop, x) < 0) keep.Add(x); }',
+  '    return keep.ToArray();',
+  '  }',
+  '  static int ScoreText(string text, string ql, string[] qw) {',
+  '    if (string.IsNullOrEmpty(text)) return -1;',
+  '    string t = Norm(text);',
+  '    if (t.Length == 0) return -1;',
+  '    if (t == ql) return 100;',
+  '    if (t.StartsWith(ql)) return 88;',
+  '    if (t.IndexOf(ql, StringComparison.Ordinal) >= 0) return 78;',
+  '    string[] tw = t.Split(new char[] { \' \' }, StringSplitOptions.RemoveEmptyEntries);',
+  '    if (qw.Length > 0 && tw.Length > 0) {',
+  '      int hit = 0;',
+  '      foreach (var w in qw) { if (Array.IndexOf(tw, w) >= 0) hit++; }',
+  '      if (hit == qw.Length && qw.Length > 1) return 74;',
+  '      if (hit > 0) { int sc = 20 + (int)(50.0 * hit / qw.Length); if (sc > 60) sc = 60; return sc; }',
+  '    }',
+  '    return -1;',
+  '  }',
+  '  static string Help(AutomationElement e) { try { return e.Current.HelpText; } catch (Exception) { return null; } }',
+  '  static string Val(AutomationElement e) { try { var vp = e.GetCurrentPattern(ValuePattern.Pattern) as ValuePattern; return vp == null ? null : vp.Current.Value; } catch (Exception) { return null; } }',
+  '  static string KindFilter(string kind) {',
+  '    string k = Norm(kind).Replace(" ", "");',
+  '    if (k == "") return "";',
+  '    if (k == "link" || k == "hyperlink" || k == "url") return "hyperlink";',
+  '    if (k == "text" || k == "textbox" || k == "textarea" || k == "input" || k == "field" || k == "textfield" || k == "entry" || k == "searchbox" || k == "searchbar" || k == "searchfield" || k == "editor" || k == "messagebox" || k == "chatbox" || k == "chatinput") return "edit";',
+  '    if (k == "dropdown" || k == "select" || k == "combo" || k == "combobox") return "combobox";',
+  '    if (k == "tab" || k == "tabitem" || k == "tabpage") return "tabitem";',
+  '    if (k == "radio" || k == "radiobutton") return "radiobutton";',
+  '    if (k == "check" || k == "checkbox" || k == "tickbox") return "checkbox";',
+  '    if (k == "list" || k == "listbox" || k == "listitem" || k == "row") return "listitem";',
+  '    if (k == "image" || k == "icon" || k == "picture") return "image";',
+  '    return k;',
+  '  }',
+  '  static bool KindOk(string kd, string kf) {',
+  '    if (kf == "") return true;',
+  '    if (kd == "") return false;',
+  '    if (kd == kf) return true;',
+  '    return kd.IndexOf(kf, StringComparison.Ordinal) >= 0 || kf.IndexOf(kd, StringComparison.Ordinal) >= 0;',
+  '  }',
+  '  static void Search(AutomationElement win, string ql, string[] qw, string kf, List<Cand> found) {',
   '    AutomationElementCollection kids;',
   '    var cond = new PropertyCondition(AutomationElement.IsControlElementProperty, true);',
   '    try { kids = win.FindAll(TreeScope.Descendants, cond); } catch (Exception) { return; }',
   '    int seen = 0;',
+  '    var any = new List<Cand>();',
   '    foreach (AutomationElement k in kids) {',
   '      if (++seen > 3000) break;',
   '      string n = Name(k);',
-  '      if (string.IsNullOrEmpty(n)) continue;',
-  '      string nl = n.ToLower();',
-  '      string aid = "";',
-  '      try { aid = (k.Current.AutomationId ?? "").ToLower(); } catch (Exception) {}',
-  '      int s = -1;',
-  '      if (nl == ql) s = 100;',
-  '      else if (nl.StartsWith(ql)) s = 80;',
-  '      else if (nl.Contains(ql)) s = 60;',
-  '      else if (aid == ql) s = 95;',
-  '      else if (aid.Length > 2 && aid.Contains(ql)) s = 50;',
-  '      if (s < 0) continue;',
+  '      int s = ScoreText(n, ql, qw);',
+  '      string help = null, val = null, aid = null;',
+  '      if (s < 78) { help = Help(k); int s2 = ScoreText(help, ql, qw); if (s2 - 6 > s) s = s2 - 6; }',
+  '      if (s < 78) { val = Val(k); int s2 = ScoreText(val, ql, qw); if (s2 - 8 > s) s = s2 - 8; }',
+  '      if (s < 78) { try { aid = k.Current.AutomationId; } catch (Exception) {} int s2 = ScoreText(aid, ql, qw); if (s2 - 12 > s) s = s2 - 12; }',
+  '      if (s <= 0) continue;',
   '      string kd = Kind(k);',
-  '      if (!string.IsNullOrEmpty(kind) && !kd.ToLower().StartsWith(kind)) continue;',
+  '      bool kok = KindOk(kd.ToLower(), kf);',
   '      if (!Usable(k)) s -= 40;',
   '      if (!OnScreen(k)) s -= 20;',
-  '      if (s > 0) found.Add(new Cand { el = k, name = n, kind = kd, score = s });',
+  '      if (s <= 0) continue;',
+  '      any.Add(new Cand { el = k, name = (n ?? help ?? val ?? aid ?? ""), kind = kd, score = s, kok = kok });',
   '    }',
+  '    foreach (var c in any) { if (c.kok) found.Add(c); }',
+  '    if (found.Count == 0) { foreach (var c in any) { found.Add(new Cand { el = c.el, name = c.name, kind = c.kind, score = c.score - 5 }); } }',
   '  }',
   '  static string WindowTitle(AutomationElement e) {',
   '    try {',
@@ -861,13 +920,15 @@ const UIA_CSHARP = [
   '  }',
   '  public static string Click(string name, string kind, string typeText) {',
   '    SetProcessDPIAware();',
-  '    string ql = (name ?? "").Trim().ToLower();',
-  '    if (ql.Length == 0) return "ERR: no name given.";',
+  '    string ql = Norm(name);',
+  '    if (ql.Length == 0) return "ERR: no usable name given (letters or digits needed).";',
+  '    string[] qw = MeaningfulWords(name);',
+  '    string kf = KindFilter(kind);',
   '    var found = new List<Cand>();',
   '    AutomationElement fg = null;',
   '    try { IntPtr h = GetForegroundWindow(); if (h != IntPtr.Zero) fg = AutomationElement.FromHandle(h); } catch (Exception) {}',
   '    if (fg == null) { try { fg = AutomationElement.FocusedElement; } catch (Exception) {} }',
-  '    if (fg != null) Search(fg, ql, kind, found);',
+  '    if (fg != null) Search(fg, ql, qw, kf, found);',
   '    if (found.Count == 0) {',
   '      try {',
   '        var tops = AutomationElement.RootElement.FindAll(TreeScope.Children, Condition.TrueCondition);',
@@ -877,7 +938,7 @@ const UIA_CSHARP = [
   '          if (fg != null && w.Current.NativeWindowHandle == fg.Current.NativeWindowHandle) continue;',
   '          string wn = Name(w) ?? "";',
   '          if (wn == "" || wn == "Program Manager") continue;',
-  '          Search(w, ql, kind, found);',
+  '          Search(w, ql, qw, kf, found);',
   '          if (found.Count > 0) break;',
   '        }',
   '      } catch (Exception) {}',
@@ -886,7 +947,7 @@ const UIA_CSHARP = [
   '      var names = new List<string>();',
   '      CollectNames(fg, 0, names);',
   '      string hint = names.Count > 0 ? " The real controls in the active window are: " + string.Join("; ", names) + "." : "";',
-  '      return "ERR: no control" + (string.IsNullOrEmpty(kind) ? "" : " of kind " + kind) + " named \'" + name + "\' in any open window." + hint + " Retry click_element with one of those exact names - no screenshot needed.";',
+  '      return "ERR: no control" + (string.IsNullOrEmpty(kf) ? "" : " of kind " + kf) + " matching \'" + name + "\' in any open window." + hint + " Retry click_element with one of those exact names (kind is optional - plain words like link or text box are understood) - no screenshot needed.";',
   '    }',
   '    found.Sort((a, b) => b.score.CompareTo(a.score));',
   '    Cand best = found[0];',
@@ -1022,7 +1083,7 @@ const TOOLS = {
       const image = await takeScreenshot(p.disp);
       if (image.imgW) lastShot = image;
       const monTxt = image.monCount > 1 ? ' — monitor ' + (image.mon || 1) + ' of ' + image.monCount : '';
-      return ok({ note: 'The screenshot is attached to this message as an image, with a red coordinate grid and yellow number labels drawn on it — read the x,y for mouse tools straight off those labels. Mouse tool coordinates are pixels in THIS picture (' + image.imgW + 'x' + image.imgH + ')' + monTxt + ', and clicking works on every monitor. If what you want to click shows a name on screen, use click_element — it is faster and more accurate than clicking pixels.', monitor: image.mon || 1, monitors: image.monCount || 1 }, 'Looked at your screen' + monTxt, { image });
+      return ok({ note: 'The screenshot is attached to this message as an image, with a red coordinate grid and yellow number labels drawn on it — read the x,y for mouse tools straight off those labels. Mouse tool coordinates are pixels in THIS picture (' + image.imgW + 'x' + image.imgH + ')' + monTxt + ', and clicking works on every monitor. If what you want to click shows words on screen (a button label, or placeholder text inside a box like "Send a message" or "Type here"), use click_element with those exact words — it is far more accurate than clicking pixels.', monitor: image.mon || 1, monitors: image.monCount || 1 }, 'Looked at your screen' + monTxt, { image });
     }
   },
 
@@ -1087,7 +1148,8 @@ const TOOLS = {
     plan: (a) => {
       const name = String(a.name || '').trim();
       if (!name) throw new Error('Say what to click (its name, like "File" or "Save").');
-      const kind = ['button', 'menuitem', 'tabitem', 'link', 'hyperlink', 'checkbox', 'radiobutton', 'listitem', 'combobox', 'menu', 'treeitem'].includes(String(a.kind || '').toLowerCase()) ? String(a.kind).toLowerCase() : '';
+      const rawKind = String(a.kind || '').trim().toLowerCase();
+      const kind = /^[a-z][a-z0-9 _-]{0,30}$/.test(rawKind) ? rawKind : ''; // any plain kind word passes - the C# side normalizes aliases and falls back if a kind rejects every match
       let typeText = null;
       if (a.type_text != null && String(a.type_text) !== '') {
         typeText = String(a.type_text);
