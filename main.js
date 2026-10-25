@@ -1,4 +1,8 @@
-const { app, BrowserWindow, shell, session, ipcMain } = require("electron");
+const { app, BrowserWindow, shell, session, ipcMain, Menu } = require("electron");
+
+// No menu "taskbar" at the top of the window (File/Edit/View/etc.).
+// The chat page is the whole app; nothing else belongs above it.
+Menu.setApplicationMenu(null);
 const path = require("path");
 const fs = require("fs");
 
@@ -73,6 +77,11 @@ function createWindow() {
   win = new BrowserWindow({
     width: 1200, height: 800, minWidth: 420, minHeight: 600,
     backgroundColor: "#1E1530", title: "Glucer", show: false, autoHideMenuBar: true,
+    // Frameless: no title bar strip at the top - just the chat, plus the
+    // native min/max/close buttons floating in the top-right corner (the
+    // page draws an invisible drag strip so the window can still be moved).
+    titleBarStyle: "hidden",
+    titleBarOverlay: { symbolColor: "#9b96a8", height: 34 },
     icon: path.join(__dirname, "build", "icon.png"),
     webPreferences: { preload: path.join(__dirname, "preload.js"), contextIsolation: true, nodeIntegration: false, sandbox: true, backgroundThrottling: false }
   });
@@ -113,7 +122,7 @@ if (!app.requestSingleInstanceLock()) {
     loadConfig();
     glucerExtras.setup();
     session.defaultSession.setPermissionRequestHandler((wc, permission, callback, details) => {
-      const ok = isAllowed(details.requestingUrl || "") && ["clipboard-sanitized-write", "fullscreen", "notifications"].includes(permission);
+      const ok = isAllowed(details.requestingUrl || "") && ["clipboard-sanitized-write", "fullscreen", "notifications", "media"].includes(permission);
       callback(ok);
     });
     createWindow();
