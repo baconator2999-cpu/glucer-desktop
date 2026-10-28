@@ -71,17 +71,45 @@ ipcMain.handle("glucer2:set-allow-all", (event, on) => {
   return { ok: true, on: config.allowEverything };
 });
 
+// The chat page knows the live theme colors; it sends them here so the
+// native min/max/close buttons always match the strip below them
+// (light or dark, any color scheme). Only hex/rgb strings are accepted.
+ipcMain.handle("glucer2:titlebar-colors", (event, colors) => {
+  if (!trusted(event)) return { ok: false };
+  try {
+    const okColor = (v) => (typeof v === "string" && /^(#[0-9a-fA-F]{3,8}|rgb)/.test(v.trim()) ? v.trim() : null);
+    const opts = {};
+    const bar = okColor(colors && colors.bar); if (bar) opts.color = bar;
+    const sym = okColor(colors && colors.symbol); if (sym) opts.symbolColor = sym;
+    if (Object.keys(opts).length && win && !win.isDestroyed()) win.setTitleBarOverlay(opts);
+    return { ok: true };
+  } catch (e) { return { ok: false }; }
+});
+
+// The chat page draws its own min/max/close buttons (themed to match the
+// window). This is where those buttons land.
+ipcMain.handle("glucer2:win-control", (event, action) => {
+  if (!trusted(event)) return { ok: false };
+  if (!win || win.isDestroyed()) return { ok: false };
+  action = String(action || "");
+  if (action === "minimize") win.minimize();
+  else if (action === "maximize") { if (win.isMaximized() || win.isFullScreen()) win.unmaximize(); else win.maximize(); }
+  else if (action === "close") win.close(); // goes to the tray, same as clicking X
+  else return { ok: false };
+  return { ok: true };
+});
+
 /* ---------- Window ---------- */
 
 function createWindow() {
   win = new BrowserWindow({
     width: 1200, height: 800, minWidth: 420, minHeight: 600,
     backgroundColor: "#1E1530", title: "Glucer", show: false, autoHideMenuBar: true,
-    // Frameless: no title bar strip at the top - just the chat, plus the
-    // native min/max/close buttons floating in the top-right corner (the
-    // page draws an invisible drag strip so the window can still be moved).
+    // Frameless: no title bar strip at the top, and NO native min/max/close
+    // buttons (those always showed up white on Windows). The chat page draws
+    // its own window buttons in the exact theme colors instead, and calls
+    // back through glucer2:win-control to minimize / maximize / close.
     titleBarStyle: "hidden",
-    titleBarOverlay: { symbolColor: "#9b96a8", height: 34 },
     icon: path.join(__dirname, "build", "icon.png"),
     webPreferences: { preload: path.join(__dirname, "preload.js"), contextIsolation: true, nodeIntegration: false, sandbox: true, backgroundThrottling: false }
   });
