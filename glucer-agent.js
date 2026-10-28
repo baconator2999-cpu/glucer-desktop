@@ -443,10 +443,38 @@ const GM_CSHARP = [
   'public class GM {',
   '  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();',
   '  [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);',
+  '  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }',
+  '  [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);',
   '  [DllImport("user32.dll")] public static extern int GetSystemMetrics(int n);',
   '  [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, int d, UIntPtr e);',
   '}'
 ].join('\n');
+// GLUCER_SMOOTH_MOUSE=off restores the old instant cursor jump.
+const SMOOTH_MOUSE = String(process.env.GLUCER_SMOOTH_MOUSE || "").trim().toLowerCase() !== "off";
+// PowerShell lines that GLIDE the cursor to the target instead of jumping:
+// it walks an eased (smoothstep) path from the CURRENT cursor position to
+// the target, so the mouse visibly travels across the screen like a human
+// moving it. Speed scales with distance: ~0.6 ms per pixel, 100-600 ms total.
+function glidePS(txExpr, tyExpr) {
+  return [
+    '$gtx = ' + txExpr + '; $gty = ' + tyExpr,
+    "$gp = New-Object 'GM+POINT'",
+    'if ([GM]::GetCursorPos([ref]$gp)) {',
+    '  $gdx = $gtx - $gp.X; $gdy = $gty - $gp.Y',
+    '  $gdist = [Math]::Sqrt($gdx * $gdx + $gdy * $gdy)',
+    '  $gn = [int][Math]::Min(48, [Math]::Max(6, [Math]::Round($gdist / 12)))',
+    '  $gms = [int][Math]::Min(600, [Math]::Max(100, $gdist * 0.6))',
+    '  $gper = [int][Math]::Max(6, [int]($gms / $gn))',
+    '  for ($gi = 1; $gi -le $gn; $gi++) {',
+    '    $gt = $gi / $gn',
+    '    $ge = $gt * $gt * (3 - 2 * $gt)',
+    '    [void][GM]::SetCursorPos([int][Math]::Round($gp.X + $gdx * $ge), [int][Math]::Round($gp.Y + $gdy * $ge))',
+    '    Start-Sleep -Milliseconds $gper',
+    '  }',
+    '} else { [void][GM]::SetCursorPos($gtx, $gty) }',
+    'Start-Sleep -Milliseconds 70'
+  ];
+}
 function mouseScript(x, y, actions, shotPath) {
   // Optional tail: after the click, photograph a small close-up around the
   // click point (clamped inside the monitor the click belongs to) with a red
@@ -479,9 +507,11 @@ function mouseScript(x, y, actions, shotPath) {
   // moves the cursor straight there — a zoomed crop at desktop position 0,0
   // must ALSO take this branch or its coordinates would be rescaled 5-8x.
   if (lastShot && (lastShot.region || Number(lastShot.originX) || Number(lastShot.originY))) {
-    return asmProlog('gm', 'GM', GM_CSHARP).concat(['[void][GM]::SetProcessDPIAware()',
-      '[void][GM]::SetCursorPos(' + Math.round(x) + ', ' + Math.round(y) + ')',
-      'Start-Sleep -Milliseconds 120', actions], tail).join('\n');
+    return asmProlog('gm', 'GM', GM_CSHARP).concat(['[void][GM]::SetProcessDPIAware()'])
+      .concat(SMOOTH_MOUSE
+        ? glidePS(String(Math.round(x)), String(Math.round(y)))
+        : ['[void][GM]::SetCursorPos(' + Math.round(x) + ', ' + Math.round(y) + ')', 'Start-Sleep -Milliseconds 120'])
+      .concat([actions], tail).join('\n');
   }
   // Self-calibration: the process that clicks measures the real screen size
   // itself and rescales, so a wrong scale report from Electron (display
@@ -489,9 +519,11 @@ function mouseScript(x, y, actions, shotPath) {
   const eW = Math.max(1, (lastShot && lastShot.screenW) || 0);
   const eH = Math.max(1, (lastShot && lastShot.screenH) || 0);
   return asmProlog('gm', 'GM', GM_CSHARP).concat(['[void][GM]::SetProcessDPIAware()',
-    '$sx = [double][GM]::GetSystemMetrics(0) / ' + eW + '; $sy = [double][GM]::GetSystemMetrics(1) / ' + eH,
-    '[void][GM]::SetCursorPos([int][Math]::Round(' + x + ' * $sx), [int][Math]::Round(' + y + ' * $sy))',
-    'Start-Sleep -Milliseconds 120', actions], tail).join('\n');
+    '$sx = [double][GM]::GetSystemMetrics(0) / ' + eW + '; $sy = [double][GM]::GetSystemMetrics(1) / ' + eH])
+    .concat(SMOOTH_MOUSE
+      ? glidePS('[int][Math]::Round(' + x + ' * $sx)', '[int][Math]::Round(' + y + ' * $sy)')
+      : ['[void][GM]::SetCursorPos([int][Math]::Round(' + x + ' * $sx), [int][Math]::Round(' + y + ' * $sy))', 'Start-Sleep -Milliseconds 120'])
+    .concat([actions], tail).join('\n');
 }
 const GT_BODY = [
   'public class GT {',
@@ -778,6 +810,8 @@ const UIA_CSHARP = [
   'public class UIA {',
   '  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();',
   '  [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);',
+  '  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }',
+  '  [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);',
   '  [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, int d, UIntPtr e);',
   '  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);',
   '  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);',
@@ -947,8 +981,22 @@ const UIA_CSHARP = [
   '    try { var pt = el.GetClickablePoint(); x = pt.X; y = pt.Y; got = true; } catch (Exception) {}',
   '    if (!got) { try { var r = el.Current.BoundingRectangle; x = r.X + r.Width / 2; y = r.Y + r.Height / 2; got = r.Width > 0 && r.Height > 0; } catch (Exception) {} }',
   '    if (!got) return null;',
-  '    SetCursorPos((int)x, (int)y);',
-  '    Thread.Sleep(120);',
+  '    // Glide to the target like a human hand (eased path, speed scales with distance) instead of teleporting the cursor.',
+  '    try {',
+  '      POINT gpp;',
+  '      if (GetCursorPos(out gpp)) {',
+  '        double ddx = x - gpp.X, ddy = y - gpp.Y;',
+  '        double dist = Math.Sqrt(ddx * ddx + ddy * ddy);',
+  '        int gn = (int)Math.Min(48, Math.Max(6, Math.Round(dist / 12.0)));',
+  '        int gper = (int)Math.Max(6, Math.Min(600, Math.Max(100, dist * 0.6)) / gn);',
+  '        for (int gi = 1; gi <= gn; gi++) {',
+  '          double gt = gi / (double)gn, ge = gt * gt * (3 - 2 * gt);',
+  '          SetCursorPos((int)Math.Round(gpp.X + ddx * ge), (int)Math.Round(gpp.Y + ddy * ge));',
+  '          Thread.Sleep(gper);',
+  '        }',
+  '      } else SetCursorPos((int)x, (int)y);',
+  '    } catch (Exception) { SetCursorPos((int)x, (int)y); }',
+  '    Thread.Sleep(70);',
   '    mouse_event(2, 0, 0, 0, UIntPtr.Zero); Thread.Sleep(40); mouse_event(4, 0, 0, 0, UIntPtr.Zero);',
   '    return "clicked at (" + (int)x + ", " + (int)y + ")";',
   '  }',
