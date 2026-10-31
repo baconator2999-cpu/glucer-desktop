@@ -6,7 +6,7 @@ Menu.setApplicationMenu(null);
 const path = require("path");
 const fs = require("fs");
 
-const START_URL = "https://glucer-chat.baconator2999.workers.dev/chat.html";
+const START_URL = "https://glucer-chat.baconator2999.workers.dev/app.html";
 const ALLOWED_HOSTS = ["glucer.com", "www.glucer.com", "glucer.netlify.app", "glucer-chat.baconator2999.workers.dev"];
 
 function isAllowed(url) {
